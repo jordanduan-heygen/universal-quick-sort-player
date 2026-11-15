@@ -4,7 +4,9 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, TypeVar
+
+from send2trash import send2trash
 
 
 IMAGE_EXTENSIONS = {
@@ -82,17 +84,32 @@ def required_copy_space(paths: Iterable[Path], destination_dir: Path) -> int:
     return required
 
 
-def move_with_lock_retry(source: Path, destination: Path) -> Path:
-    """Windows can retain browser or antivirus handles briefly after playback stops."""
-    for attempt in range(12):
+Result = TypeVar("Result")
+
+
+def is_file_lock_error(error: OSError) -> bool:
+    """Return whether Windows refused an operation because a file handle is still open."""
+    return getattr(error, "winerror", None) == 32 or error.errno in {13, 16, 32}
+
+
+def retry_locked(operation: Callable[[], Result], attempts: int = 12) -> Result:
+    """Windows can retain browser, FFmpeg, or antivirus handles briefly after playback stops."""
+    for attempt in range(attempts):
         try:
-            return Path(shutil.move(str(source), str(destination)))
+            return operation()
         except OSError as error:
-            locked = getattr(error, "winerror", None) == 32 or error.errno in {13, 16}
-            if not locked or attempt == 11:
+            if not is_file_lock_error(error) or attempt == attempts - 1:
                 raise
             time.sleep(.08 * (attempt + 1))
     raise RuntimeError("unreachable")
+
+
+def move_with_lock_retry(source: Path, destination: Path) -> Path:
+    return retry_locked(lambda: Path(shutil.move(str(source), str(destination))))
+
+
+def trash_with_lock_retry(path: Path) -> None:
+    retry_locked(lambda: send2trash(str(path)))
 
 
 def move_paths(paths: Iterable[Path], destination_dir: Path) -> list[MoveRecord]:

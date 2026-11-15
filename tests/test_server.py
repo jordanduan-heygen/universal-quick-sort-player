@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -92,7 +93,7 @@ def test_cached_browser_proxy_is_seekable(tmp_path: Path, monkeypatch):
 def test_video_repair_explains_missing_moov_atom(tmp_path: Path, monkeypatch):
     video = tmp_path / "incomplete.mp4"
     video.write_bytes(b"\x00\x00\x00\x18ftypisomtruncated")
-    monkeypatch.setattr(server.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(
+    monkeypatch.setattr(server, "run_media_command", lambda *_args, **_kwargs: SimpleNamespace(
         returncode=1, stderr="moov atom not found\nInvalid data found when processing input",
     ))
     response = client.post("/api/video-repair", json={"path": str(video)})
@@ -239,6 +240,52 @@ def test_move_retries_temporary_windows_file_lock(tmp_path: Path, monkeypatch):
     assert len(attempts) == 3
 
 
+def test_move_releases_active_media_streams(tmp_path: Path):
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video")
+    destination = tmp_path / "sorted"
+    stream = server.open_media_stream(source)
+    try:
+        moved = client.post("/api/move", json={"paths": [str(source)], "destination": str(destination)})
+        assert moved.status_code == 200
+        assert stream.closed
+        assert (destination / source.name).read_bytes() == b"video"
+    finally:
+        if not stream.closed:
+            stream.close()
+
+
+def test_trash_releases_active_media_streams(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(server, "REVIEW_FILE", tmp_path / "review.json")
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video")
+    stream = server.open_media_stream(source)
+    monkeypatch.setattr(server, "trash_with_lock_retry", lambda path: path.unlink())
+    try:
+        trashed = client.post("/api/trash", json={"paths": [str(source)]})
+        assert trashed.status_code == 200
+        assert trashed.json()["trashed"] == 1
+        assert stream.closed
+        assert not source.exists()
+    finally:
+        if not stream.closed:
+            stream.close()
+
+
+def test_cancel_media_work_stops_tracked_processes(tmp_path: Path):
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video")
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    server.track_media_process(source, process)
+    try:
+        assert server.cancel_media_work([source]) == 1
+        assert process.poll() is not None
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
 def test_trash_retries_temporary_windows_file_lock(tmp_path: Path, monkeypatch):
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"video")
@@ -252,8 +299,8 @@ def test_trash_retries_temporary_windows_file_lock(tmp_path: Path, monkeypatch):
         if len(attempts) < 3:
             raise LockedFileError(13, "file is being used by Python")
 
-    monkeypatch.setattr(server, "send2trash", temporarily_locked)
-    monkeypatch.setattr(server.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(file_ops, "send2trash", temporarily_locked)
+    monkeypatch.setattr(file_ops.time, "sleep", lambda _seconds: None)
     response = client.post("/api/trash", json={"paths": [str(source)]})
     assert response.status_code == 200
     assert response.json()["trashed"] == 1

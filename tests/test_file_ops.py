@@ -4,6 +4,7 @@ from quicksortplayer.file_ops import (
     category_for,
     collision_safe_path,
     move_paths,
+    trash_with_lock_retry,
     undo_moves,
 )
 
@@ -61,3 +62,26 @@ def test_undo_skips_when_original_path_is_occupied(tmp_path: Path):
     assert restored == []
     assert skipped == records
     assert records[0].destination.exists()
+
+
+def test_trash_retries_temporary_windows_file_lock(tmp_path: Path, monkeypatch):
+    from quicksortplayer import file_ops
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video")
+    attempts = []
+
+    class LockedFileError(PermissionError):
+        winerror = 32
+
+    def temporarily_locked(_path):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise LockedFileError(13, "file is being used")
+        source.unlink()
+
+    monkeypatch.setattr(file_ops, "send2trash", temporarily_locked)
+    monkeypatch.setattr(file_ops.time, "sleep", lambda _seconds: None)
+    trash_with_lock_retry(source)
+    assert len(attempts) == 3
+    assert not source.exists()
