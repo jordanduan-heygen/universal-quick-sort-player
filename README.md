@@ -49,6 +49,32 @@ Sort and Group controls support name, date, size, type, extension, rating, and r
 
 ## Windows
 
+### Recommended: one EXE
+
+Download **`Quick Sort Player.exe`** from the repository's latest GitHub Release.
+It is a self-contained Windows 10/11 build: no Python install, setup script, or
+source folder is required. Double-click it and keep its console window open while
+using the app. The browser opens automatically; press `Ctrl+C` in the console to stop it.
+
+The EXE still stores preferences and caches outside itself in
+`%USERPROFILE%\.quick-sort-player`, so replacing the EXE with a newer version keeps
+your destinations, saved locations, and review state.
+
+### Build the EXE yourself
+
+On Windows, double-click **`Build Quick Sort Player.cmd`**. After tests pass, the
+single distributable is written to:
+
+```text
+dist\Quick Sort Player.exe
+```
+
+GitHub Actions also builds the same EXE from a clean Windows machine. Run the
+**Build Windows EXE** workflow manually for a downloadable artifact, or push a
+version tag such as `v0.2.0` to attach it to a GitHub Release automatically.
+
+### Source installation
+
 Install Python 3.11 or newer from [python.org](https://python.org/downloads/).
 Download and extract this repository, then double-click:
 
