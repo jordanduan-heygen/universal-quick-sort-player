@@ -763,7 +763,10 @@ async function updateReview(changes, { advance = false } = {}) {
 
 function buildFilmstrip() {
   if (!state.primary || !state.primary.kind.toLowerCase().includes("video") || !Number.isFinite(videoPreview.duration) || !videoPreview.duration) return;
-  const times = [0, .25, .5, .75, .98].map((ratio) => Math.max(0, videoPreview.duration * ratio));
+  const times = Array.from({ length: 10 }, (_, index) => {
+    const ratio = index / 9 * .98;
+    return Math.max(0, videoPreview.duration * ratio);
+  });
   $("#filmstrip").innerHTML = times.map((seconds) => `
     <button data-film-time="${seconds}" title="${formatTime(seconds)}"><img loading="lazy" src="${endpoint("/api/video-frame", { path: state.primary.path, time: seconds })}" alt="Frame at ${formatTime(seconds)}"></button>
   `).join("");
