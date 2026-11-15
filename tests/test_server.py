@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -86,6 +87,18 @@ def test_cached_browser_proxy_is_seekable(tmp_path: Path, monkeypatch):
     assert response.status_code == 206
     assert response.content == b"compatible"
     assert response.headers["content-type"].startswith("video/mp4")
+
+
+def test_video_repair_explains_missing_moov_atom(tmp_path: Path, monkeypatch):
+    video = tmp_path / "incomplete.mp4"
+    video.write_bytes(b"\x00\x00\x00\x18ftypisomtruncated")
+    monkeypatch.setattr(server.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(
+        returncode=1, stderr="moov atom not found\nInvalid data found when processing input",
+    ))
+    response = client.post("/api/video-repair", json={"path": str(video)})
+    assert response.status_code == 422
+    assert "incomplete" in response.json()["detail"].lower()
+    assert "cannot be reconstructed" in response.json()["detail"].lower()
 
 
 def test_temporal_video_match_rejects_shared_intro():

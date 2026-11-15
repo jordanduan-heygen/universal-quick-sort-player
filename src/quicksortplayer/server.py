@@ -32,7 +32,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .file_ops import (
     AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MoveRecord, category_for,
-    move_paths, path_size, required_copy_space, undo_moves,
+    collision_safe_path, move_paths, path_size, required_copy_space, undo_moves,
 )
 from . import __version__
 
@@ -368,6 +368,11 @@ def create_browser_proxy(path: Path, destination: Path, job: dict[str, object]) 
                     pass
         stderr = process.stderr.read() if process.stderr else ""
         if process.wait() != 0 or not temporary.exists() or not temporary.stat().st_size:
+            if "moov atom not found" in stderr.lower() or "invalid data found when processing input" in stderr.lower():
+                raise RuntimeError(
+                    "This MP4/MOV is incomplete or missing its initialization data. Use Tools → Repair video; "
+                    "if repair cannot read it, download the original again"
+                )
             raise RuntimeError(stderr.strip() or "FFmpeg could not create a browser-compatible video")
         temporary.replace(destination)
         trim_proxy_cache(keep=destination)
@@ -392,6 +397,41 @@ def cancel_proxy_work(paths: list[Path]) -> None:
     for process in processes:
         if isinstance(process, subprocess.Popen) and process.poll() is None:
             process.kill()
+
+
+def repair_video_file(path: Path) -> Path:
+    destination = collision_safe_path(path.with_name(f"{path.stem} (repaired).mp4"))
+    temporary = destination.with_name(f"{destination.stem}.{time.time_ns()}.tmp.mp4")
+    commands = [[
+        get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-err_detect", "ignore_err",
+        "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+        "-movflags", "+faststart", "-y", str(temporary),
+    ]]
+    try:
+        with path.open("rb") as source:
+            signature = source.read(16)
+        if signature.startswith((b"\x00\x00\x00\x01", b"\x00\x00\x01")):
+            commands.append([
+                get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-f", "h264", "-framerate", "30",
+                "-i", str(path), "-c:v", "copy", "-an", "-movflags", "+faststart", "-y", str(temporary),
+            ])
+        errors: list[str] = []
+        for command in commands:
+            temporary.unlink(missing_ok=True)
+            result = subprocess.run(command, capture_output=True, text=True, timeout=600)
+            if result.returncode == 0 and temporary.exists() and temporary.stat().st_size:
+                temporary.replace(destination)
+                return destination
+            errors.append(result.stderr.strip())
+        combined = "\n".join(errors).lower()
+        if "moov atom not found" in combined or "invalid data found when processing input" in combined:
+            raise ValueError(
+                "The file is incomplete: its MP4 index/initialization segment is missing. "
+                "That data cannot be reconstructed from this file; finish or repeat the download."
+            )
+        raise ValueError("The video could not be remuxed. It may be truncated or use a damaged container.")
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def temporary_image_path(destination: Path) -> Path:
@@ -952,6 +992,20 @@ def browser_proxy_file(path: str, request: Request) -> Response:
     if not destination.exists() or not destination.stat().st_size:
         raise HTTPException(404, "The browser-compatible video is not ready")
     return stream_path(destination, request, "video/mp4")
+
+
+@app.post("/api/video-repair")
+async def repair_video(request: RevealRequest) -> dict[str, object]:
+    file_path = checked_path(request.path, require_file=True)
+    if file_path.suffix.lower() not in VIDEO_EXTENSIONS:
+        raise HTTPException(400, "A video file is required")
+    try:
+        repaired = await run_in_threadpool(repair_video_file, file_path)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    except (OSError, subprocess.SubprocessError) as error:
+        raise HTTPException(409, f"The repaired copy could not be written: {error}") from error
+    return {"ok": True, "path": str(repaired), "name": repaired.name}
 
 
 @app.get("/api/thumbnail")

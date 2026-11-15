@@ -1355,6 +1355,23 @@ async function openSelected() {
   } catch (error) { showToast(error.message); }
 }
 
+async function repairSelectedVideo() {
+  if (!state.primary || state.primary.preview_type !== "video") return showToast("Select a video first");
+  const item = state.primary;
+  const releasedVideo = await releaseVideosForMove([item.path]);
+  showToast("Checking and remuxing the video…");
+  try {
+    const result = await api("/api/video-repair", { method: "POST", body: JSON.stringify({ path: item.path }) });
+    $("#tools").close();
+    await loadFolder(state.currentPath);
+    if (state.items.some((candidate) => candidate.path === result.path)) selectItem(result.path);
+    showToast(`Created ${result.name}; the original is unchanged`);
+  } catch (error) {
+    if (releasedVideo && state.primary?.path === item.path) showPreview(item);
+    showToast(error.message);
+  }
+}
+
 function openCompare() {
   const items = selectedItems().filter((item) => ["images", "videos"].includes(item.category));
   if (items.length !== 2) return showToast("Select exactly two images or videos to compare");
@@ -1799,6 +1816,7 @@ function buildCommands() {
     ...state.recentFolders.slice(0, 5).map((path) => ({ label: `Recent: ${path.split(/[\\/]/).filter(Boolean).at(-1) || path}`, hint: path, run: () => loadFolder(path) })),
     { label: "Reveal selected in system explorer", hint: "", run: revealSelected },
     { label: "Open selected in default app", hint: "", run: openSelected },
+    { label: "Repair selected video container", hint: "", run: repairSelectedVideo },
     ...destinationCommands,
     { label: "Keep selected", hint: "K", run: () => updateReview({ status: "keep" }, { advance: true }) },
     { label: "Reject selected", hint: "X", run: () => updateReview({ status: "reject" }, { advance: true }) },
@@ -1909,6 +1927,7 @@ function bindEvents() {
   $("#undo-button").addEventListener("click", undoMove);
   $("#reveal-button").addEventListener("click", revealSelected);
   $("#open-default-button").addEventListener("click", openSelected);
+  $("#repair-video-button").addEventListener("click", repairSelectedVideo);
   $("#trash-button").addEventListener("click", askToTrash);
   $("#quick-trash-button").addEventListener("click", askToTrash);
   $("#tools-button").addEventListener("click", () => $("#tools").showModal());

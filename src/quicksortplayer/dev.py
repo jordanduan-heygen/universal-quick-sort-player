@@ -14,6 +14,7 @@ from pathlib import Path
 import uvicorn
 
 from . import __version__
+from .updater import maybe_install_update
 
 
 def _open_when_ready(url: str) -> None:
@@ -57,7 +58,11 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=int(os.environ.get("QUICK_SORT_PORT", "8767")))
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--no-reload", action="store_true")
+    parser.add_argument("--no-update", action="store_true")
     args = parser.parse_args()
+
+    if not args.no_update and maybe_install_update(__version__, sys.argv[1:]):
+        return 0
 
     frozen = bool(getattr(sys, "frozen", False))
     already_running = _quick_sort_is_running(args.port)
