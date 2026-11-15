@@ -29,6 +29,7 @@ const state = {
   sortBy: localStorage.getItem("quick-sort-sort-by") || "name",
   sortDirection: localStorage.getItem("quick-sort-sort-direction") || "asc",
   groupBy: localStorage.getItem("quick-sort-group-by") || "none",
+  duplicateGroups: [],
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -903,25 +904,64 @@ function toggleComparePlayback() {
 async function openDuplicates() {
   $("#tools").close();
   $("#duplicates-summary").textContent = "Scanning this folder…";
-  $("#duplicates-results").innerHTML = '<div class="empty-list">Comparing file hashes and image fingerprints…</div>';
+  $("#duplicates-space").textContent = "—";
+  $("#duplicates-trash").disabled = true;
+  $("#duplicates-results").innerHTML = '<div class="empty-list">Comparing file hashes and image/video fingerprints…</div>';
   $("#duplicates").showModal();
   try {
     const result = await api(endpoint("/api/duplicates", { path: state.currentPath }));
-    const groups = [
-      ...result.exact.map((paths) => ({ label: "Exact copies", paths })),
-      ...result.visual.map((paths) => ({ label: "Visual matches", paths })),
-    ];
-    $("#duplicates-summary").textContent = `${groups.length} group${groups.length === 1 ? "" : "s"} · ${result.scanned} files scanned`;
-    $("#duplicates-results").innerHTML = groups.length ? groups.map((group, groupIndex) => `
-      <section class="duplicate-group"><strong>${group.label}</strong>${group.paths.map((path) => `<button data-duplicate-group="${groupIndex}" title="Select this group">${escapeHtml(path.split(/[\\/]/).at(-1))}</button>`).join("")}</section>
-    `).join("") : '<div class="empty-list">No duplicates found in this folder.</div>';
-    $$('[data-duplicate-group]').forEach((button) => button.addEventListener("click", () => {
-      state.selected = new Set(groups[Number(button.dataset.duplicateGroup)].paths);
-      state.primary = state.items.find((item) => state.selected.has(item.path)) || null;
+    state.duplicateGroups = result.groups || [];
+    const labels = { exact: "Exact copies", similar_image: "Similar images", similar_video: "Similar videos" };
+    $("#duplicates-summary").textContent = `${state.duplicateGroups.length} group${state.duplicateGroups.length === 1 ? "" : "s"} · ${result.scanned} files scanned · up to ${formatBytes(result.reclaimable)} reclaimable`;
+    $("#duplicates-results").innerHTML = state.duplicateGroups.length ? state.duplicateGroups.map((group, groupIndex) => `
+      <section class="duplicate-group">
+        <div class="duplicate-group-head"><strong>${labels[group.kind] || "Possible duplicates"}</strong><span>${group.confidence}% match · ${formatBytes(group.reclaimable)} reclaimable</span></div>
+        ${group.files.map((file, fileIndex) => {
+          const keeper = file.path === group.keeper;
+          const thumbnail = ["images", "videos"].includes(file.category) ? endpoint("/api/thumbnail", { path: file.path }) : "";
+          return `<label class="duplicate-file">
+            <input type="checkbox" data-duplicate-check="${groupIndex}:${fileIndex}" ${!keeper && group.kind === "exact" ? "checked" : ""} aria-label="Remove ${escapeHtml(file.name)}">
+            <button type="button" class="duplicate-thumb" data-duplicate-preview="${groupIndex}:${fileIndex}" title="Preview ${escapeHtml(file.name)}">${thumbnail ? `<img src="${thumbnail}" alt="">` : `<span>${escapeHtml(file.name.split(".").at(-1).toUpperCase())}</span>`}</button>
+            <span class="duplicate-copy"><strong>${escapeHtml(file.name)}</strong><span>${new Date(file.modified * 1000).toLocaleString()}</span>${keeper ? '<span class="keeper-badge">Suggested keeper</span>' : ""}</span>
+            <span class="duplicate-size">${formatBytes(file.size)}</span>
+          </label>`;
+        }).join("")}
+      </section>
+    `).join("") : '<div class="empty-list">No duplicate images or videos found in this folder.</div>';
+    $$('[data-duplicate-check]').forEach((checkbox) => checkbox.addEventListener("change", updateDuplicateSelection));
+    $$('[data-duplicate-preview]').forEach((button) => button.addEventListener("click", (event) => {
+      event.preventDefault();
+      const [groupIndex, fileIndex] = button.dataset.duplicatePreview.split(":").map(Number);
+      const file = state.duplicateGroups[groupIndex].files[fileIndex];
       $("#duplicates").close();
-      renderFiles(); showPreview(state.primary); updateActionBar();
+      selectItem(file.path);
     }));
+    updateDuplicateSelection();
   } catch (error) { $("#duplicates-results").innerHTML = `<div class="empty-list">${escapeHtml(error.message)}</div>`; }
+}
+
+function duplicateSelectedFiles() {
+  return $$('[data-duplicate-check]:checked').map((checkbox) => {
+    const [groupIndex, fileIndex] = checkbox.dataset.duplicateCheck.split(":").map(Number);
+    return state.duplicateGroups[groupIndex].files[fileIndex];
+  }).filter((file, index, files) => files.findIndex((candidate) => candidate.path === file.path) === index);
+}
+
+function updateDuplicateSelection() {
+  const files = duplicateSelectedFiles();
+  $("#duplicates-space").textContent = formatBytes(files.reduce((total, file) => total + file.size, 0));
+  $("#duplicates-trash").disabled = files.length === 0;
+  $("#duplicates-trash").textContent = files.length ? `Move ${files.length} to Recycle Bin` : "Move selected to Recycle Bin";
+}
+
+function trashDuplicateSelection() {
+  const files = duplicateSelectedFiles();
+  if (!files.length) return;
+  state.selected = new Set(files.map((file) => file.path));
+  state.primary = state.items.find((item) => state.selected.has(item.path)) || null;
+  $("#duplicates").close();
+  renderFiles(); showPreview(state.primary); updateActionBar();
+  askToTrash();
 }
 
 function renameValue(item, index, pattern) {
@@ -1114,6 +1154,7 @@ function bindEvents() {
   $("#compare-zoom-in").addEventListener("click", () => updateCompareZoom(2));
   $("#compare-zoom-out").addEventListener("click", () => updateCompareZoom(.5));
   $("#duplicates-button").addEventListener("click", openDuplicates);
+  $("#duplicates-trash").addEventListener("click", trashDuplicateSelection);
   $("#rename-button").addEventListener("click", openRename);
   $("#metadata-button").addEventListener("click", showMetadata);
   $("#rename-pattern").addEventListener("input", renderRenamePreview);

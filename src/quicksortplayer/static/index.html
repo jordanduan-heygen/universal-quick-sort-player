@@ -201,7 +201,11 @@
   </dialog>
 
   <dialog id="duplicates" class="dialog duplicates-dialog">
-    <header class="dialog-head"><div><h2>Duplicate finder</h2><p id="duplicates-summary">Scanning this folder…</p></div><button type="button" class="close-dialog" data-close="duplicates">Close</button></header>
+    <header class="dialog-head"><div><h2>Duplicate cleanup</h2><p id="duplicates-summary">Scanning this folder…</p></div><button type="button" class="close-dialog" data-close="duplicates">Close</button></header>
+    <div class="duplicate-overview">
+      <div><strong id="duplicates-space">—</strong><span>selected to reclaim</span></div>
+      <button id="duplicates-trash" class="danger-fill" disabled>Move selected to Recycle Bin</button>
+    </div>
     <div id="duplicates-results" class="duplicates-results"></div>
   </dialog>
 

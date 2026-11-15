@@ -339,13 +339,69 @@ def hash_file(path: Path) -> str:
 
 def perceptual_hash(path: Path) -> str | None:
     try:
-        with Image.open(path) as image:
+        cached = thumb_cache_path(path)
+        source = cached if cached.exists() else path
+        with Image.open(source) as image:
             pixels = list(ImageOps.grayscale(image).resize((8, 8), Image.Resampling.LANCZOS).get_flattened_data())
         average = sum(pixels) / len(pixels)
         bits = "".join("1" if value >= average else "0" for value in pixels)
         return f"{int(bits, 2):016x}"
     except Exception:
         return None
+
+
+def video_perceptual_hash(path: Path) -> str | None:
+    """Return a tiny visual fingerprint from an early representative frame."""
+    try:
+        frame = subprocess.run(
+            [
+                get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-ss", "1",
+                "-i", str(path), "-frames:v", "1", "-vf", "scale=8:8,format=gray",
+                "-f", "rawvideo", "pipe:1",
+            ],
+            capture_output=True, check=True, timeout=30,
+        ).stdout
+        if len(frame) != 64:
+            return None
+        average = sum(frame) / len(frame)
+        bits = "".join("1" if value >= average else "0" for value in frame)
+        return f"{int(bits, 2):016x}"
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def duplicate_file_payload(path: Path) -> dict[str, object]:
+    stat = path.stat()
+    return {
+        "path": str(path), "name": path.name, "size": stat.st_size,
+        "modified": stat.st_mtime, "category": category_for(path),
+    }
+
+
+def duplicate_group(kind: str, paths: list[Path], confidence: int) -> dict[str, object]:
+    files = [duplicate_file_payload(path) for path in paths]
+    # Prefer the largest source, then the newest, as the suggested keeper.
+    keeper = max(files, key=lambda item: (int(item["size"]), float(item["modified"])))
+    return {
+        "kind": kind, "confidence": confidence, "files": files,
+        "keeper": keeper["path"],
+        "reclaimable": sum(int(item["size"]) for item in files if item["path"] != keeper["path"]),
+    }
+
+
+def visual_groups(paths: list[Path], fingerprint_fn, threshold: int) -> list[list[Path]]:
+    clusters: list[tuple[int, list[Path]]] = []
+    for path in paths:
+        fingerprint = fingerprint_fn(path)
+        if not fingerprint:
+            continue
+        value = int(fingerprint, 16)
+        cluster = next((group for representative, group in clusters if (representative ^ value).bit_count() <= threshold), None)
+        if cluster is None:
+            clusters.append((value, [path]))
+        else:
+            cluster.append(path)
+    return [group for _, group in clusters if len(group) > 1]
 
 
 def find_duplicates(folder: Path) -> dict[str, object]:
@@ -356,30 +412,40 @@ def find_duplicates(folder: Path) -> dict[str, object]:
             by_size.setdefault(path.stat().st_size, []).append(path)
         except OSError:
             pass
-    exact: list[list[str]] = []
+    exact_paths: list[list[Path]] = []
     for candidates in by_size.values():
         if len(candidates) < 2:
             continue
-        by_hash: dict[str, list[str]] = {}
+        by_hash: dict[str, list[Path]] = {}
         for path in candidates:
             try:
-                by_hash.setdefault(hash_file(path), []).append(str(path))
+                by_hash.setdefault(hash_file(path), []).append(path)
             except OSError:
                 pass
-        exact.extend(group for group in by_hash.values() if len(group) > 1)
+        exact_paths.extend(group for group in by_hash.values() if len(group) > 1)
     images = [path for path in files if path.suffix.lower() in IMAGE_EXTENSIONS][:500]
-    visual_clusters: list[tuple[int, list[str]]] = []
-    for path in images:
-        fingerprint = perceptual_hash(path)
-        if fingerprint:
-            value = int(fingerprint, 16)
-            cluster = next((group for representative, group in visual_clusters if (representative ^ value).bit_count() <= 6), None)
-            if cluster is None:
-                visual_clusters.append((value, [str(path)]))
-            else:
-                cluster.append(str(path))
-    visual = [group for _, group in visual_clusters if len(group) > 1]
-    return {"exact": exact, "visual": visual, "scanned": len(files), "visual_scanned": len(images)}
+    videos = [path for path in files if path.suffix.lower() in VIDEO_EXTENSIONS][:200]
+    visual_paths = visual_groups(images, perceptual_hash, 6)
+    video_paths = visual_groups(videos, video_perceptual_hash, 4)
+    exact_sets = [set(group) for group in exact_paths]
+
+    def is_only_exact(group: list[Path]) -> bool:
+        return any(set(group).issubset(exact) for exact in exact_sets)
+
+    visual_paths = [group for group in visual_paths if not is_only_exact(group)]
+    video_paths = [group for group in video_paths if not is_only_exact(group)]
+    groups = [
+        *(duplicate_group("exact", group, 100) for group in exact_paths),
+        *(duplicate_group("similar_image", group, 88) for group in visual_paths),
+        *(duplicate_group("similar_video", group, 84) for group in video_paths),
+    ]
+    exact = [[str(path) for path in group] for group in exact_paths]
+    visual = [[str(path) for path in group] for group in visual_paths]
+    return {
+        "exact": exact, "visual": visual, "groups": groups,
+        "scanned": len(files), "visual_scanned": len(images), "video_scanned": len(videos),
+        "reclaimable": sum(int(group["reclaimable"]) for group in groups),
+    }
 
 
 def index_folder(folder: Path) -> None:

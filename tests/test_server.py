@@ -64,6 +64,11 @@ def test_duplicate_scan_and_metadata(tmp_path: Path):
     duplicates = client.get("/api/duplicates", params={"path": str(tmp_path)})
     assert duplicates.status_code == 200
     assert any({str(first), str(second)} == set(group) for group in duplicates.json()["exact"])
+    group = duplicates.json()["groups"][0]
+    assert group["kind"] == "exact"
+    assert group["confidence"] == 100
+    assert group["reclaimable"] == first.stat().st_size
+    assert len(group["files"]) == 2
     metadata = client.get("/api/metadata", params={"path": str(first)}).json()
     assert metadata["width"] == 32
     assert metadata["height"] == 24

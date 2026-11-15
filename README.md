@@ -44,7 +44,15 @@ Sort and Group controls support name, date, size, type, extension, rating, and r
 ## Windows
 
 Install Python 3.11 or newer from [python.org](https://python.org/downloads/).
-Download and extract this repository, then open PowerShell in the folder:
+Download and extract this repository, then double-click:
+
+**`Quick Sort Player.cmd`**
+
+It installs the app on first launch, starts the private local server, and opens
+the browser automatically. No terminal commands are required. Keep its window
+open while using the app.
+
+The manual launchers are still available if you prefer them:
 
 ```powershell
 .\setup.cmd
