@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -81,6 +82,19 @@ def required_copy_space(paths: Iterable[Path], destination_dir: Path) -> int:
     return required
 
 
+def move_with_lock_retry(source: Path, destination: Path) -> Path:
+    """Windows can retain browser or antivirus handles briefly after playback stops."""
+    for attempt in range(12):
+        try:
+            return Path(shutil.move(str(source), str(destination)))
+        except OSError as error:
+            locked = getattr(error, "winerror", None) == 32 or error.errno in {13, 16}
+            if not locked or attempt == 11:
+                raise
+            time.sleep(.08 * (attempt + 1))
+    raise RuntimeError("unreachable")
+
+
 def move_paths(paths: Iterable[Path], destination_dir: Path) -> list[MoveRecord]:
     paths = list(paths)
     destination_dir = destination_dir.expanduser().resolve()
@@ -97,7 +111,7 @@ def move_paths(paths: Iterable[Path], destination_dir: Path) -> list[MoveRecord]
         if source == destination_dir or destination_dir in source.parents:
             continue
         destination = collision_safe_path(destination_dir / source.name)
-        moved = Path(shutil.move(str(source), str(destination)))
+        moved = move_with_lock_retry(source, destination)
         records.append(MoveRecord(source, moved.resolve()))
     return records
 

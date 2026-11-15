@@ -1275,6 +1275,7 @@ async function releaseVideosForMove(paths) {
     releases.push(releaseVideoElement(nextVideoPreload));
   }
   await Promise.all(releases);
+  await wait(120);
   return activeMatches;
 }
 

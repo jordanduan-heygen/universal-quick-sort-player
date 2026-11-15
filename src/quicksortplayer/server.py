@@ -352,6 +352,9 @@ def create_browser_proxy(path: Path, destination: Path, job: dict[str, object]) 
     try:
         trim_proxy_cache(path.stat().st_size, destination)
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        with proxy_jobs_lock:
+            job["source"] = str(path)
+            job["process"] = process
         job["status"] = "running"
         assert process.stdout is not None
         for line in process.stdout:
@@ -373,7 +376,21 @@ def create_browser_proxy(path: Path, destination: Path, job: dict[str, object]) 
     finally:
         if process and process.poll() is None:
             process.kill()
+        with proxy_jobs_lock:
+            job.pop("process", None)
         temporary.unlink(missing_ok=True)
+
+
+def cancel_proxy_work(paths: list[Path]) -> None:
+    targets = {str(path.expanduser().resolve()) for path in paths}
+    with proxy_jobs_lock:
+        processes = [
+            job.get("process") for job in proxy_jobs.values()
+            if job.get("source") in targets and job.get("status") in {"queued", "running"}
+        ]
+    for process in processes:
+        if isinstance(process, subprocess.Popen) and process.poll() is None:
+            process.kill()
 
 
 def temporary_image_path(destination: Path) -> Path:
@@ -1191,9 +1208,17 @@ def rename_files(request: RenameRequest) -> dict[str, object]:
 @app.post("/api/move")
 def move(request: MoveRequest) -> dict[str, object]:
     destination = Path(request.destination).expanduser().resolve()
+    source_paths = [Path(value) for value in request.paths]
+    cancel_proxy_work(source_paths)
     try:
-        records = move_paths([Path(value) for value in request.paths], destination)
+        records = move_paths(source_paths, destination)
     except PermissionError as error:
+        if getattr(error, "winerror", None) == 32:
+            raise HTTPException(
+                409,
+                "Windows still has this file open after several retries. Pause playback in other apps or "
+                "close any Explorer preview pane using the video, then retry.",
+            ) from error
         raise HTTPException(
             403,
             f"Windows blocked the move. A video may still be open, or {destination} may not allow writes. "

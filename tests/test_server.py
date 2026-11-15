@@ -13,6 +13,7 @@ import pymupdf
 import pytest
 
 from quicksortplayer import server
+from quicksortplayer import file_ops
 from quicksortplayer.server import app
 
 
@@ -199,6 +200,30 @@ def test_move_reports_windows_disk_full_clearly(tmp_path: Path, monkeypatch):
     assert response.status_code == 507
     assert "needs about 5.00 GB" in response.json()["detail"]
     assert "only 1.00 GB" in response.json()["detail"]
+
+
+def test_move_retries_temporary_windows_file_lock(tmp_path: Path, monkeypatch):
+    source = tmp_path / "clip.mp4"
+    destination = tmp_path / "sorted.mp4"
+    source.write_bytes(b"video")
+    attempts = []
+    real_move = shutil.move
+
+    class LockedFileError(PermissionError):
+        winerror = 32
+
+    def temporarily_locked(raw_source, raw_destination):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise LockedFileError(13, "file is being used")
+        return real_move(raw_source, raw_destination)
+
+    monkeypatch.setattr(file_ops.shutil, "move", temporarily_locked)
+    monkeypatch.setattr(file_ops.time, "sleep", lambda _seconds: None)
+    moved = file_ops.move_with_lock_retry(source, destination)
+    assert moved == destination
+    assert destination.read_bytes() == b"video"
+    assert len(attempts) == 3
 
 
 def test_custom_shortcuts_are_persisted(tmp_path: Path, monkeypatch):
