@@ -1006,6 +1006,9 @@ async function buildFilmstrip() {
   try {
     const spriteUrl = await cachedFilmstripSprite(filmstripPath);
     if (state.primary?.path !== filmstripPath) return;
+    // Reuse the already-cached carousel sprite for instant scrubber hover
+    // previews, especially on large videos where the 40-frame sprite is skipped.
+    state.sprite = { url: spriteUrl, count: 10, columns: 10, rows: 1 };
     $$("#filmstrip .frame-sprite").forEach((frame, index) => {
       frame.textContent = "";
       frame.style.backgroundImage = `url("${spriteUrl}")`;
@@ -1035,7 +1038,7 @@ function scheduleMediaEnhancements(item) {
       loadAudioAnalysis(item.path);
       if (item.preview_type === "video") prepareVideoSprite(item.path);
     }
-  }, large ? 1200 : 150);
+  }, large ? 300 : 150);
 }
 
 function nextVideoInLine() {
@@ -1105,7 +1108,9 @@ function positionSeekPreview(seconds, clientX) {
     const row = Math.floor(index / state.sprite.columns);
     visual.style.backgroundImage = `url("${state.sprite.url}")`;
     visual.style.backgroundSize = `${state.sprite.columns * 100}% ${state.sprite.rows * 100}%`;
-    visual.style.backgroundPosition = `${column / (state.sprite.columns - 1) * 100}% ${row / (state.sprite.rows - 1) * 100}%`;
+    const columnPosition = state.sprite.columns > 1 ? column / (state.sprite.columns - 1) * 100 : 0;
+    const rowPosition = state.sprite.rows > 1 ? row / (state.sprite.rows - 1) * 100 : 0;
+    visual.style.backgroundPosition = `${columnPosition}% ${rowPosition}%`;
     image.classList.add("hidden");
     return;
   }

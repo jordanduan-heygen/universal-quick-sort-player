@@ -681,7 +681,7 @@ def media_duration(path: Path) -> float:
         [get_ffmpeg_exe(), "-hide_banner", "-i", str(path)],
         path, capture_output=True, text=True, timeout=30,
     )
-    match = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", process.stderr)
+    match = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", process.stderr or "")
     if not match:
         raise ValueError("Media duration is unavailable")
     return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
@@ -732,7 +732,7 @@ def analyze_audio(path: Path) -> dict[str, object]:
     pcm = run_media_command([
         get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", str(path),
         "-vn", "-ac", "1", "-ar", "100", "-f", "s16le", "-",
-    ], path, capture_output=True, timeout=120, check=True).stdout
+    ], path, capture_output=True, timeout=120, check=True).stdout or b""
     values = array.array("h")
     values.frombytes(pcm[:len(pcm) - len(pcm) % 2])
     if sys.byteorder != "little":
@@ -748,8 +748,8 @@ def analyze_audio(path: Path) -> dict[str, object]:
         get_ffmpeg_exe(), "-hide_banner", "-i", str(path), "-af", "silencedetect=noise=-35dB:d=0.7",
         "-f", "null", "-",
     ], path, capture_output=True, text=True, timeout=120)
-    starts = [float(value) for value in re.findall(r"silence_start:\s*([\d.]+)", silence_process.stderr)]
-    ends = [float(value) for value in re.findall(r"silence_end:\s*([\d.]+)", silence_process.stderr)]
+    starts = [float(value) for value in re.findall(r"silence_start:\s*([\d.]+)", silence_process.stderr or "")]
+    ends = [float(value) for value in re.findall(r"silence_end:\s*([\d.]+)", silence_process.stderr or "")]
     if len(starts) > len(ends):
         ends.append(duration)
     silence = [[round(start, 3), round(min(duration, end), 3)] for start, end in zip(starts, ends) if end > start]
@@ -796,7 +796,7 @@ def video_temporal_fingerprint(path: Path) -> dict[str, object] | None:
                     "-vf", "scale=8:8,format=gray", "-f", "rawvideo", "pipe:1",
                 ],
                 path, capture_output=True, timeout=30, check=True,
-            ).stdout
+            ).stdout or b""
             if len(frame) != 64:
                 return None
             average = sum(frame) / len(frame)
@@ -808,7 +808,7 @@ def video_temporal_fingerprint(path: Path) -> dict[str, object] | None:
         temporary.write_text(json.dumps(result), encoding="utf-8")
         temporary.replace(cache)
         return result
-    except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, subprocess.SubprocessError):
         return None
 
 
@@ -1307,10 +1307,11 @@ def metadata(path: str) -> dict[str, object]:
                 [get_ffmpeg_exe(), "-hide_banner", "-i", str(file_path)],
                 file_path, text=True, capture_output=True, timeout=15,
             )
-            duration = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", probe.stderr)
-            bitrate = re.search(r"bitrate:\s*(\d+\s*kb/s)", probe.stderr)
-            video = re.search(r"Video:\s*([^,]+).*?(\d{2,5})x(\d{2,5})", probe.stderr)
-            audio = re.search(r"Audio:\s*([^,]+)", probe.stderr)
+            probe_text = probe.stderr or ""
+            duration = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", probe_text)
+            bitrate = re.search(r"bitrate:\s*(\d+\s*kb/s)", probe_text)
+            video = re.search(r"Video:\s*([^,]+).*?(\d{2,5})x(\d{2,5})", probe_text)
+            audio = re.search(r"Audio:\s*([^,]+)", probe_text)
             if duration:
                 result["duration"] = int(duration.group(1)) * 3600 + int(duration.group(2)) * 60 + float(duration.group(3))
             if bitrate:

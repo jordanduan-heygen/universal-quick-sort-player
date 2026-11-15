@@ -129,6 +129,23 @@ def test_temporal_video_match_rejects_shared_intro():
     assert server.temporal_video_fingerprints_match(left, close_copy) is True
 
 
+def test_duplicate_scan_skips_video_with_missing_ffmpeg_diagnostics(tmp_path: Path, monkeypatch):
+    broken = tmp_path / "broken.mp4"
+    broken.write_bytes(b"not a readable video")
+    monkeypatch.setattr(server, "THUMB_DIR", tmp_path / "cache")
+    monkeypatch.setattr(
+        server,
+        "run_media_command",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=None, stderr=None),
+    )
+
+    result = server.find_duplicates(tmp_path)
+
+    assert result["scanned"] == 1
+    assert result["video_scanned"] == 1
+    assert result["groups"] == []
+
+
 def test_windows_reveal_selects_exact_file(tmp_path: Path, monkeypatch):
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"video")
