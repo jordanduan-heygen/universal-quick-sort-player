@@ -30,6 +30,14 @@ const state = {
   sortDirection: localStorage.getItem("quick-sort-sort-direction") || "asc",
   groupBy: localStorage.getItem("quick-sort-group-by") || "none",
   duplicateGroups: [],
+  duplicateJob: null,
+  duplicateTimer: null,
+  duplicateNotified: new Set(),
+  locationTree: new Map(),
+  expandedLocations: new Set(),
+  preloadedNextPath: null,
+  preloadController: null,
+  seekPreviewTimer: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -40,11 +48,16 @@ const stage = $("#stage");
 const hoverPreview = $("#hover-preview");
 const hoverPreviewImage = $("#hover-preview-image");
 const hoverPreviewVideo = $("#hover-preview-video");
+const nextVideoPreload = $("#next-video-preload");
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>'"]/g, (character) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;",
   })[character]);
+}
+
+function normalizedPath(value) {
+  return String(value || "").replaceAll("\\", "/").replace(/\/$/, "").toLowerCase();
 }
 
 function endpoint(path, params = {}) {
@@ -179,29 +192,70 @@ async function loadInitialData() {
   const linkedPath = new URLSearchParams(window.location.search).get("path");
   const rememberedPath = localStorage.getItem("quick-sort-last-path");
   await loadFolder(linkedPath || rememberedPath || downloads?.path || state.locations[0]?.path);
+  await resumeDuplicateJobs();
 }
 
 function renderLocations() {
-  $("#locations").innerHTML = state.locations.map((location) => `
-    <div class="nav-location-row">
-      <button class="nav-item ${location.path === state.currentPath ? "active" : ""} ${location.available === false ? "unavailable" : ""}"
-        data-path="${escapeHtml(location.path)}" data-short="${escapeHtml(shortLabel(location.name))}" title="${escapeHtml(location.path)}">
-        <span>${escapeHtml(location.name)}</span>${location.hotkey ? `<kbd>G ${escapeHtml(location.hotkey)}</kbd>` : ""}
-      </button>
-      ${location.source === "saved" ? `<button class="remove-location" data-remove-location="${escapeHtml(location.path)}" title="Remove saved folder" aria-label="Remove ${escapeHtml(location.name)}">×</button>` : ""}
-    </div>
-  `).join("");
+  const nodeMarkup = (location, depth = 0, root = false) => {
+    const key = normalizedPath(location.path);
+    const expanded = state.expandedLocations.has(key);
+    const children = state.locationTree.get(key) || [];
+    const canExpand = location.has_children !== false && location.available !== false;
+    return `<div class="location-node" data-depth="${depth}">
+      <div class="nav-location-row" style="--location-depth:${depth}">
+        <button class="location-disclosure ${canExpand ? "" : "empty"}" data-expand-location="${escapeHtml(location.path)}" aria-label="${expanded ? "Collapse" : "Expand"} ${escapeHtml(location.name)}">${expanded ? "⌄" : "›"}</button>
+        <button class="nav-item ${normalizedPath(location.path) === normalizedPath(state.currentPath) ? "active" : ""} ${location.available === false ? "unavailable" : ""}"
+          data-path="${escapeHtml(location.path)}" data-short="${escapeHtml(shortLabel(location.name))}" title="${escapeHtml(location.path)}">
+          <span>${escapeHtml(location.name)}</span>${location.hotkey ? `<kbd>G ${escapeHtml(location.hotkey)}</kbd>` : ""}
+        </button>
+        ${root && location.source === "saved" ? `<button class="remove-location" data-remove-location="${escapeHtml(location.path)}" title="Remove saved folder" aria-label="Remove ${escapeHtml(location.name)}">×</button>` : ""}
+      </div>
+      ${expanded ? `<div class="location-children">${children.map((child) => nodeMarkup(child, depth + 1)).join("")}</div>` : ""}
+    </div>`;
+  };
+  $("#locations").innerHTML = state.locations.map((location) => nodeMarkup(location, 0, true)).join("");
   $$("#locations .nav-item").forEach((button) => button.addEventListener("click", () => {
     if (button.classList.contains("unavailable")) return showToast("This drive or folder is not currently available");
     loadFolder(button.dataset.path);
   }));
+  $$('[data-expand-location]').forEach((button) => button.addEventListener("click", () => toggleLocationFolder(button.dataset.expandLocation)));
   $$('[data-remove-location]').forEach((button) => button.addEventListener("click", () => removeSavedLocation(button.dataset.removeLocation)));
+  bindLocationDrops();
+}
+
+async function toggleLocationFolder(path) {
+  const key = normalizedPath(path);
+  if (state.expandedLocations.has(key)) {
+    state.expandedLocations.delete(key);
+    renderLocations();
+    return;
+  }
+  try {
+    if (!state.locationTree.has(key)) {
+      const response = await api(endpoint("/api/subfolders", { path }));
+      state.locationTree.set(key, response.folders || []);
+    }
+    state.expandedLocations.add(key);
+    renderLocations();
+  } catch (error) { showToast(error.message); }
+}
+
+function bindLocationDrops() {
+  $$("#locations .nav-item[data-path]").forEach((button) => {
+    button.addEventListener("dragover", (event) => { if (event.dataTransfer.types.includes("application/x-quick-sort-paths")) { event.preventDefault(); button.classList.add("drop-target"); } });
+    button.addEventListener("dragleave", () => button.classList.remove("drop-target"));
+    button.addEventListener("drop", (event) => {
+      event.preventDefault();
+      button.classList.remove("drop-target");
+      const paths = JSON.parse(event.dataTransfer.getData("application/x-quick-sort-paths") || "[]");
+      if (paths.length) movePathsToDestination(paths, button.dataset.path);
+    });
+  });
 }
 
 async function savePickedLocation(path) {
   const saved = [...(state.config.saved_locations || [])];
-  const normalize = (value) => value.replaceAll("\\", "/").replace(/\/$/, "").toLowerCase();
-  if (!saved.some((location) => normalize(location.path) === normalize(path))) {
+  if (!saved.some((location) => normalizedPath(location.path) === normalizedPath(path))) {
     const name = path.split(/[\\/]/).filter(Boolean).at(-1) || path;
     saved.push({ name, path });
   }
@@ -215,8 +269,7 @@ async function savePickedLocation(path) {
 }
 
 async function removeSavedLocation(path) {
-  const normalize = (value) => value.replaceAll("\\", "/").replace(/\/$/, "").toLowerCase();
-  const saved = (state.config.saved_locations || []).filter((location) => normalize(location.path) !== normalize(path));
+  const saved = (state.config.saved_locations || []).filter((location) => normalizedPath(location.path) !== normalizedPath(path));
   try {
     state.config = await api("/api/config", {
       method: "PUT",
@@ -681,6 +734,7 @@ function showPreview(item) {
     $("#selected-meta").textContent = "Images and video open here at full fidelity.";
     $("#review-bar").classList.add("hidden");
     updateActionBar();
+    clearNextVideoPreload();
     return;
   }
   if (!item.is_dir) document.body.classList.add("inspecting");
@@ -715,6 +769,7 @@ function showPreview(item) {
     showFileFallback(item, (item.extension || "FILE").replace(".", "").toUpperCase());
   }
   updateActionBar();
+  preloadNextVideo();
 }
 
 async function showTextualPreview(item) {
@@ -772,6 +827,66 @@ function buildFilmstrip() {
   `).join("");
   $("#filmstrip").classList.remove("hidden");
   $$("#filmstrip [data-film-time]").forEach((button) => button.addEventListener("click", () => { videoPreview.currentTime = Number(button.dataset.filmTime); }));
+}
+
+function nextVideoInLine() {
+  if (!state.primary || state.primary.preview_type !== "video") return null;
+  const videos = state.visibleItems.filter((item) => item.preview_type === "video");
+  const index = videos.findIndex((item) => item.path === state.primary.path);
+  return index >= 0 ? videos[index + 1] || null : null;
+}
+
+function clearNextVideoPreload() {
+  state.preloadController?.abort();
+  state.preloadController = null;
+  state.preloadedNextPath = null;
+  nextVideoPreload.pause();
+  nextVideoPreload.removeAttribute("src");
+  nextVideoPreload.load();
+}
+
+function preloadNextVideo() {
+  const next = nextVideoInLine();
+  if (!next) return clearNextVideoPreload();
+  if (state.preloadedNextPath === next.path) return;
+  clearNextVideoPreload();
+  state.preloadedNextPath = next.path;
+  const controller = new AbortController();
+  state.preloadController = controller;
+  nextVideoPreload.src = endpoint("/api/media", { path: next.path });
+  nextVideoPreload.load();
+  nextVideoPreload.addEventListener("loadedmetadata", async () => {
+    if (state.preloadedNextPath !== next.path || controller.signal.aborted || !Number.isFinite(nextVideoPreload.duration)) return;
+    const times = Array.from({ length: 10 }, (_, index) => nextVideoPreload.duration * (index / 9 * .98));
+    for (let index = 0; index < times.length; index += 2) {
+      if (controller.signal.aborted) return;
+      await Promise.allSettled(times.slice(index, index + 2).map((time) => fetch(endpoint("/api/video-frame", { path: next.path, time }), { signal: controller.signal, cache: "force-cache" })));
+    }
+  }, { once: true });
+}
+
+function updateSeekVisuals() {
+  const duration = Number.isFinite(videoPreview.duration) ? videoPreview.duration : 0;
+  const played = duration ? videoPreview.currentTime / duration * 100 : 0;
+  let buffered = played;
+  if (duration && videoPreview.buffered.length) buffered = videoPreview.buffered.end(videoPreview.buffered.length - 1) / duration * 100;
+  $("#seek").style.setProperty("--seek-played", `${Math.max(0, Math.min(100, played))}%`);
+  $("#seek").style.setProperty("--seek-buffered", `${Math.max(played, Math.min(100, buffered))}%`);
+}
+
+function showSeekPreview(event) {
+  if (!Number.isFinite(videoPreview.duration) || !videoPreview.duration || !state.primary) return;
+  const rect = $("#seek").getBoundingClientRect();
+  const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+  const seconds = videoPreview.duration * ratio;
+  const preview = $("#seek-preview");
+  preview.style.left = `${ratio * 100}%`;
+  $("#seek-preview-time").textContent = formatTime(seconds);
+  preview.classList.remove("hidden");
+  clearTimeout(state.seekPreviewTimer);
+  state.seekPreviewTimer = setTimeout(() => {
+    $("#seek-preview-image").src = endpoint("/api/video-frame", { path: state.primary.path, time: Math.round(seconds * 2) / 2 });
+  }, 90);
 }
 
 function stepFrame(direction) {
@@ -889,7 +1004,8 @@ async function releaseVideoElement(element) {
 async function releaseVideosForMove(paths) {
   const activeMatches = !videoPreview.classList.contains("hidden") && state.primary && paths.includes(state.primary.path);
   const hoverMatches = state.hoverPath && paths.includes(state.hoverPath) && !hoverPreviewVideo.classList.contains("hidden");
-  if (!activeMatches && !hoverMatches) return false;
+  const preloadMatches = state.preloadedNextPath && paths.includes(state.preloadedNextPath);
+  if (!activeMatches && !hoverMatches && !preloadMatches) return false;
   if (document.pictureInPictureElement === videoPreview) {
     try { await document.exitPictureInPicture(); } catch (_) { /* Continue releasing the file handle. */ }
   }
@@ -905,6 +1021,11 @@ async function releaseVideosForMove(paths) {
     hoverPreviewVideo.removeAttribute("poster");
     releases.push(releaseVideoElement(hoverPreviewVideo));
   }
+  if (preloadMatches) {
+    state.preloadController?.abort();
+    state.preloadedNextPath = null;
+    releases.push(releaseVideoElement(nextVideoPreload));
+  }
   await Promise.all(releases);
   return activeMatches;
 }
@@ -914,6 +1035,10 @@ async function moveSelected(category) {
   const destination = state.config.destinations?.[category];
   if (!paths.length) return showToast("Select at least one file first");
   if (!destination) return $("#settings").showModal();
+  await movePathsToDestination(paths, destination);
+}
+
+async function movePathsToDestination(paths, destination) {
   const allFiles = state.visibleItems.filter((item) => !item.is_dir);
   const sameType = state.primary ? allFiles.filter((item) => item.category === state.primary.category) : [];
   const queue = sameType.length > 1 ? sameType : allFiles;
@@ -1004,19 +1129,11 @@ function toggleComparePlayback() {
   $("#compare-play").textContent = shouldPlay ? "Pause both" : "Play both";
 }
 
-async function openDuplicates() {
-  $("#tools").close();
-  $("#duplicates-summary").textContent = "Scanning this folder…";
-  $("#duplicates-space").textContent = "—";
-  $("#duplicates-trash").disabled = true;
-  $("#duplicates-results").innerHTML = '<div class="empty-list">Comparing file hashes and image/video fingerprints…</div>';
-  $("#duplicates").showModal();
-  try {
-    const result = await api(endpoint("/api/duplicates", { path: state.currentPath }));
-    state.duplicateGroups = result.groups || [];
-    const labels = { exact: "Exact copies", similar_image: "Similar images", similar_video: "Similar videos" };
-    $("#duplicates-summary").textContent = `${state.duplicateGroups.length} group${state.duplicateGroups.length === 1 ? "" : "s"} · ${result.scanned} files scanned · up to ${formatBytes(result.reclaimable)} reclaimable`;
-    $("#duplicates-results").innerHTML = state.duplicateGroups.length ? state.duplicateGroups.map((group, groupIndex) => `
+function renderDuplicateResult(result) {
+  state.duplicateGroups = result.groups || [];
+  const labels = { exact: "Exact copies", similar_image: "Similar images", similar_video: "Similar videos" };
+  $("#duplicates-summary").textContent = `${state.duplicateGroups.length} group${state.duplicateGroups.length === 1 ? "" : "s"} · ${result.scanned} files scanned · up to ${formatBytes(result.reclaimable)} reclaimable`;
+  $("#duplicates-results").innerHTML = state.duplicateGroups.length ? state.duplicateGroups.map((group, groupIndex) => `
       <section class="duplicate-group">
         <div class="duplicate-group-head"><strong>${labels[group.kind] || "Possible duplicates"}</strong><span>${group.confidence}% match · ${formatBytes(group.reclaimable)} reclaimable</span></div>
         ${group.files.map((file, fileIndex) => {
@@ -1030,17 +1147,121 @@ async function openDuplicates() {
           </label>`;
         }).join("")}
       </section>
-    `).join("") : '<div class="empty-list">No duplicate images or videos found in this folder.</div>';
-    $$('[data-duplicate-check]').forEach((checkbox) => checkbox.addEventListener("change", updateDuplicateSelection));
-    $$('[data-duplicate-preview]').forEach((button) => button.addEventListener("click", (event) => {
-      event.preventDefault();
-      const [groupIndex, fileIndex] = button.dataset.duplicatePreview.split(":").map(Number);
-      const file = state.duplicateGroups[groupIndex].files[fileIndex];
-      $("#duplicates").close();
-      selectItem(file.path);
-    }));
-    updateDuplicateSelection();
-  } catch (error) { $("#duplicates-results").innerHTML = `<div class="empty-list">${escapeHtml(error.message)}</div>`; }
+  `).join("") : '<div class="empty-list">No duplicate images or videos found in this folder.</div>';
+  $$('[data-duplicate-check]').forEach((checkbox) => checkbox.addEventListener("change", updateDuplicateSelection));
+  $$('[data-duplicate-preview]').forEach((button) => button.addEventListener("click", (event) => {
+    event.preventDefault();
+    const [groupIndex, fileIndex] = button.dataset.duplicatePreview.split(":").map(Number);
+    const file = state.duplicateGroups[groupIndex].files[fileIndex];
+    $("#duplicates").close();
+    selectItem(file.path);
+  }));
+  updateDuplicateSelection();
+}
+
+function renderDuplicateProgress(job) {
+  const status = job.status === "queued" ? "Queued" : "Scanning";
+  $("#duplicates-summary").textContent = `${status} ${job.name || "this folder"} in the background…`;
+  $("#duplicates-space").textContent = "—";
+  $("#duplicates-trash").disabled = true;
+  $("#duplicates-results").innerHTML = '<div class="empty-list">You can close this window and keep sorting. We’ll alert you when the scan is ready.</div>';
+}
+
+function updateDuplicateJobCard(job, { force = false } = {}) {
+  state.duplicateJob = job;
+  const card = $("#background-job");
+  card.classList.remove("ready", "error");
+  if (job.status === "complete") {
+    const groups = job.result?.groups?.length || 0;
+    card.classList.add("ready");
+    $("#background-job-message").textContent = `Duplicate scan ready · ${groups} group${groups === 1 ? "" : "s"}`;
+  } else if (job.status === "error") {
+    card.classList.add("error");
+    $("#background-job-message").textContent = `Duplicate scan failed · ${job.error || "Unknown error"}`;
+  } else {
+    $("#background-job-message").textContent = `Scanning ${job.name || "folder"} for duplicates…`;
+  }
+  if (force || job.status !== "idle") card.classList.remove("hidden");
+}
+
+function announceDuplicateCompletion(job) {
+  if (state.duplicateNotified.has(job.id)) return;
+  state.duplicateNotified.add(job.id);
+  updateDuplicateJobCard(job, { force: true });
+  const groups = job.result?.groups?.length || 0;
+  showToast(`Duplicate scan finished · ${groups} group${groups === 1 ? "" : "s"} found`);
+  document.title = `✓ Duplicates ready · Quick Sort Player`;
+  if (document.hidden && "Notification" in window && Notification.permission === "granted") {
+    new Notification("Quick Sort Player", { body: `Duplicate scan finished: ${groups} group${groups === 1 ? "" : "s"} found.` });
+  }
+}
+
+async function pollDuplicateJob(path) {
+  clearTimeout(state.duplicateTimer);
+  try {
+    const job = await api(endpoint("/api/duplicates/status", { path }));
+    updateDuplicateJobCard(job);
+    if (job.status === "queued" || job.status === "running") {
+      if ($("#duplicates").open && $("#duplicates").dataset.path === path) renderDuplicateProgress(job);
+      state.duplicateTimer = setTimeout(() => pollDuplicateJob(path), 1200);
+    } else if (job.status === "complete") {
+      announceDuplicateCompletion(job);
+      if ($("#duplicates").open && $("#duplicates").dataset.path === path) renderDuplicateResult(job.result);
+    } else if (job.status === "error") {
+      if ($("#duplicates").open) $("#duplicates-results").innerHTML = `<div class="empty-list">${escapeHtml(job.error || "The scan failed")}</div>`;
+    }
+  } catch (error) {
+    state.duplicateTimer = setTimeout(() => pollDuplicateJob(path), 1800);
+  }
+}
+
+async function startDuplicateScan(path) {
+  const job = await api("/api/duplicates/start", { method: "POST", body: JSON.stringify({ path }) });
+  updateDuplicateJobCard(job, { force: true });
+  renderDuplicateProgress(job);
+  pollDuplicateJob(path);
+}
+
+async function openDuplicates() {
+  if ($("#tools").open) $("#tools").close();
+  const path = state.currentPath;
+  $("#duplicates").dataset.path = path;
+  $("#duplicates").showModal();
+  try {
+    const job = await api(endpoint("/api/duplicates/status", { path }));
+    if (job.status === "complete") {
+      state.duplicateJob = job;
+      renderDuplicateResult(job.result);
+    } else if (job.status === "queued" || job.status === "running") {
+      updateDuplicateJobCard(job, { force: true });
+      renderDuplicateProgress(job);
+      pollDuplicateJob(path);
+    } else {
+      await startDuplicateScan(path);
+    }
+  } catch (error) {
+    $("#duplicates-results").innerHTML = `<div class="empty-list">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+async function viewDuplicateJob() {
+  const job = state.duplicateJob;
+  if (!job?.path) return;
+  if (normalizedPath(state.currentPath) !== normalizedPath(job.path)) await loadFolder(job.path);
+  await openDuplicates();
+  document.title = "Quick Sort Player";
+}
+
+async function resumeDuplicateJobs() {
+  try {
+    const response = await api("/api/duplicates/jobs");
+    const jobs = response.jobs || [];
+    const job = jobs.find((candidate) => ["queued", "running"].includes(candidate.status)) || jobs[0];
+    if (job) {
+      updateDuplicateJobCard(job, { force: true });
+      pollDuplicateJob(job.path);
+    }
+  } catch (_) { /* Background job discovery is optional. */ }
 }
 
 function duplicateSelectedFiles() {
@@ -1262,7 +1483,10 @@ function bindEvents() {
   $("#compare-zoom-in").addEventListener("click", () => updateCompareZoom(2));
   $("#compare-zoom-out").addEventListener("click", () => updateCompareZoom(.5));
   $("#duplicates-button").addEventListener("click", openDuplicates);
+  $("#duplicates-rescan").addEventListener("click", () => startDuplicateScan($("#duplicates").dataset.path || state.currentPath).catch((error) => showToast(error.message)));
   $("#duplicates-trash").addEventListener("click", trashDuplicateSelection);
+  $("#background-job-view").addEventListener("click", () => viewDuplicateJob().catch((error) => showToast(error.message)));
+  $("#background-job-dismiss").addEventListener("click", () => $("#background-job").classList.add("hidden"));
   $("#rename-button").addEventListener("click", openRename);
   $("#metadata-button").addEventListener("click", showMetadata);
   $("#rename-pattern").addEventListener("input", renderRenamePreview);
@@ -1304,7 +1528,11 @@ function bindEvents() {
   $("#fullscreen-button").addEventListener("click", toggleFullscreen);
   $("#seek").addEventListener("input", (event) => {
     if (Number.isFinite(videoPreview.duration)) videoPreview.currentTime = videoPreview.duration * Number(event.target.value) / 1000;
+    updateSeekVisuals();
   });
+  $("#seek").addEventListener("pointermove", showSeekPreview);
+  $("#seek").addEventListener("pointerleave", () => { clearTimeout(state.seekPreviewTimer); $("#seek-preview").classList.add("hidden"); });
+  $("#seek").addEventListener("pointerdown", showSeekPreview);
   $("#search").addEventListener("input", (event) => {
     state.query = event.target.value;
     state.renderLimit = 180;
@@ -1380,11 +1608,15 @@ function bindEvents() {
     if (dimensions.width) $("#selected-meta").textContent += ` · ${dimensions.width} × ${dimensions.height}px`;
     applyZoom();
     buildFilmstrip();
+    updateSeekVisuals();
   });
   videoPreview.addEventListener("timeupdate", () => {
     $("#seek").value = Number.isFinite(videoPreview.duration) && videoPreview.duration ? Math.round(videoPreview.currentTime / videoPreview.duration * 1000) : 0;
     $("#time-value").textContent = `${formatTime(videoPreview.currentTime)} / ${formatTime(videoPreview.duration)}`;
+    updateSeekVisuals();
   });
+  videoPreview.addEventListener("progress", updateSeekVisuals);
+  videoPreview.addEventListener("durationchange", updateSeekVisuals);
   videoPreview.addEventListener("play", () => { $("#play-button").textContent = "Pause"; });
   videoPreview.addEventListener("pause", () => { $("#play-button").textContent = "Play"; });
   videoPreview.addEventListener("volumechange", () => {

@@ -131,7 +131,10 @@
         <button id="play-button" class="play-button">Play</button>
         <button id="back-10" class="transport-button">−10s</button>
         <button id="frame-back" class="transport-button" title="Previous frame">‹ Frame</button>
-        <input id="seek" type="range" min="0" max="1000" value="0" aria-label="Seek">
+        <div id="timeline" class="timeline">
+          <input id="seek" type="range" min="0" max="1000" value="0" aria-label="Seek">
+          <div id="seek-preview" class="seek-preview hidden" aria-hidden="true"><img id="seek-preview-image" alt=""><span id="seek-preview-time">0:00</span></div>
+        </div>
         <span id="time-value" class="time-value">0:00 / 0:00</span>
         <button id="forward-10" class="transport-button">+10s</button>
         <button id="frame-forward" class="transport-button" title="Next frame">Frame ›</button>
@@ -205,7 +208,7 @@
   </dialog>
 
   <dialog id="duplicates" class="dialog duplicates-dialog">
-    <header class="dialog-head"><div><h2>Duplicate cleanup</h2><p id="duplicates-summary">Scanning this folder…</p></div><button type="button" class="close-dialog" data-close="duplicates">Close</button></header>
+    <header class="dialog-head"><div><h2>Duplicate cleanup</h2><p id="duplicates-summary">Scanning this folder…</p></div><div class="dialog-head-actions"><button type="button" id="duplicates-rescan">Scan again</button><button type="button" class="close-dialog" data-close="duplicates">Close</button></div></header>
     <div class="duplicate-overview">
       <div><strong id="duplicates-space">—</strong><span>selected to reclaim</span></div>
       <button id="duplicates-trash" class="danger-fill" disabled>Move selected to Recycle Bin</button>
@@ -245,6 +248,13 @@
   </dialog>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <video id="next-video-preload" class="hidden" preload="auto" muted playsinline aria-hidden="true"></video>
+  <aside id="background-job" class="background-job hidden" role="status" aria-live="polite">
+    <span id="background-job-indicator" class="job-spinner" aria-hidden="true"></span>
+    <span id="background-job-message">Duplicate scan running…</span>
+    <button id="background-job-view" type="button">View</button>
+    <button id="background-job-dismiss" type="button" aria-label="Dismiss notification">×</button>
+  </aside>
   <aside id="hover-preview" class="hover-preview hidden" aria-hidden="true">
     <div class="hover-preview-media">
       <img id="hover-preview-image" class="hidden" alt="">

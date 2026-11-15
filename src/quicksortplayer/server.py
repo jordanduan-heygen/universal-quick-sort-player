@@ -51,6 +51,8 @@ register_heif_opener()
 app = FastAPI(title="Quick Sort Player", docs_url=None, redoc_url=None)
 undo_stack: list[list[MoveRecord]] = []
 index_jobs: dict[str, dict[str, object]] = {}
+duplicate_jobs: dict[str, dict[str, object]] = {}
+duplicate_jobs_lock = threading.Lock()
 
 
 @app.middleware("http")
@@ -485,6 +487,35 @@ def find_duplicates(folder: Path) -> dict[str, object]:
     }
 
 
+def duplicate_job_snapshot(job: dict[str, object] | None, *, include_result: bool = True) -> dict[str, object]:
+    if not job:
+        return {"status": "idle"}
+    snapshot = {key: value for key, value in job.items() if include_result or key != "result"}
+    return snapshot
+
+
+def run_duplicate_job(folder: Path, job_id: str) -> None:
+    key = str(folder)
+    with duplicate_jobs_lock:
+        job = duplicate_jobs.get(key)
+        if not job or job.get("id") != job_id:
+            return
+        job["status"] = "running"
+        job["started_at"] = time.time()
+    try:
+        result = find_duplicates(folder)
+    except Exception as error:
+        with duplicate_jobs_lock:
+            job = duplicate_jobs.get(key)
+            if job and job.get("id") == job_id:
+                job.update({"status": "error", "error": str(error), "finished_at": time.time()})
+        return
+    with duplicate_jobs_lock:
+        job = duplicate_jobs.get(key)
+        if job and job.get("id") == job_id:
+            job.update({"status": "complete", "result": result, "finished_at": time.time()})
+
+
 def index_folder(folder: Path) -> None:
     key = str(folder)
     paths = [path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | AUDIO_EXTENSIONS | {".pdf"}]
@@ -540,6 +571,25 @@ def health() -> dict[str, object]:
 def locations() -> dict[str, object]:
     config = load_config()
     return {"locations": common_locations(config), "config": config, "platform": sys.platform}
+
+
+@app.get("/api/subfolders")
+def subfolders(path: str) -> dict[str, object]:
+    folder = checked_path(path, require_dir=True)
+    children: list[dict[str, object]] = []
+    try:
+        directories = sorted((entry for entry in folder.iterdir() if entry.is_dir() and not entry.name.startswith(".")), key=lambda entry: entry.name.lower())
+        for entry in directories:
+            try:
+                has_children = any(child.is_dir() and not child.name.startswith(".") for child in entry.iterdir())
+            except (PermissionError, OSError):
+                has_children = False
+            children.append({"name": entry.name, "path": str(entry), "has_children": has_children})
+    except PermissionError as error:
+        raise HTTPException(403, "Windows denied access to this folder") from error
+    except OSError as error:
+        raise HTTPException(409, f"This folder could not be read: {error}") from error
+    return {"path": str(folder), "folders": children}
 
 
 @app.get("/api/list")
@@ -706,6 +756,41 @@ def metadata(path: str) -> dict[str, object]:
 async def duplicates(path: str) -> dict[str, object]:
     folder = checked_path(path, require_dir=True)
     return await run_in_threadpool(find_duplicates, folder)
+
+
+@app.post("/api/duplicates/start")
+def start_duplicate_scan(request: RevealRequest) -> dict[str, object]:
+    folder = checked_path(request.path, require_dir=True)
+    key = str(folder)
+    with duplicate_jobs_lock:
+        current = duplicate_jobs.get(key)
+        if current and current.get("status") in {"queued", "running"}:
+            return duplicate_job_snapshot(current)
+        job_id = str(time.time_ns())
+        duplicate_jobs[key] = {
+            "id": job_id,
+            "status": "queued",
+            "path": key,
+            "name": folder.name or key,
+            "queued_at": time.time(),
+        }
+        snapshot = duplicate_job_snapshot(duplicate_jobs[key])
+    threading.Thread(target=run_duplicate_job, args=(folder, job_id), daemon=True).start()
+    return snapshot
+
+
+@app.get("/api/duplicates/status")
+def duplicate_scan_status(path: str) -> dict[str, object]:
+    folder = checked_path(path, require_dir=True)
+    with duplicate_jobs_lock:
+        return duplicate_job_snapshot(duplicate_jobs.get(str(folder)))
+
+
+@app.get("/api/duplicates/jobs")
+def duplicate_scan_jobs() -> dict[str, object]:
+    with duplicate_jobs_lock:
+        jobs = [duplicate_job_snapshot(job, include_result=False) for job in duplicate_jobs.values()]
+    return {"jobs": sorted(jobs, key=lambda job: float(job.get("queued_at", 0)), reverse=True)}
 
 
 @app.post("/api/index")

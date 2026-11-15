@@ -2,6 +2,7 @@ from pathlib import Path
 import os
 import sys
 import tempfile
+import time
 import zipfile
 
 from fastapi.testclient import TestClient
@@ -76,6 +77,34 @@ def test_duplicate_scan_and_metadata(tmp_path: Path):
     metadata = client.get("/api/metadata", params={"path": str(first)}).json()
     assert metadata["width"] == 32
     assert metadata["height"] == 24
+
+
+def test_duplicate_scan_runs_as_background_job(tmp_path: Path):
+    server.duplicate_jobs.clear()
+    first = tmp_path / "one.txt"
+    second = tmp_path / "two.txt"
+    first.write_text("same")
+    second.write_text("same")
+    started = client.post("/api/duplicates/start", json={"path": str(tmp_path)})
+    assert started.status_code == 200
+    assert started.json()["status"] in {"queued", "running"}
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        status = client.get("/api/duplicates/status", params={"path": str(tmp_path)}).json()
+        if status["status"] == "complete":
+            break
+        time.sleep(.02)
+    assert status["status"] == "complete"
+    assert status["result"]["groups"][0]["kind"] == "exact"
+
+
+def test_subfolders_are_listed_for_sidebar_tree(tmp_path: Path):
+    child = tmp_path / "Child"
+    grandchild = child / "Grandchild"
+    grandchild.mkdir(parents=True)
+    response = client.get("/api/subfolders", params={"path": str(tmp_path)})
+    assert response.status_code == 200
+    assert response.json()["folders"] == [{"name": "Child", "path": str(child), "has_children": True}]
 
 
 def test_batch_rename_contract(tmp_path: Path, monkeypatch):
