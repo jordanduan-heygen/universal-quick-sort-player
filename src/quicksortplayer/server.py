@@ -27,12 +27,11 @@ from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 import pymupdf
 from pydantic import BaseModel
-from send2trash import send2trash
 from starlette.concurrency import run_in_threadpool
 
 from .file_ops import (
     AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MoveRecord, category_for,
-    collision_safe_path, move_paths, path_size, required_copy_space, undo_moves,
+    collision_safe_path, move_paths, path_size, required_copy_space, trash_with_lock_retry, undo_moves,
 )
 from . import __version__
 
@@ -65,6 +64,10 @@ duplicate_jobs: dict[str, dict[str, object]] = {}
 duplicate_jobs_lock = threading.Lock()
 proxy_jobs: dict[str, dict[str, object]] = {}
 proxy_jobs_lock = threading.Lock()
+active_streams: dict[str, set[object]] = {}
+active_streams_lock = threading.Lock()
+media_processes: dict[str, set[subprocess.Popen]] = {}
+media_processes_lock = threading.Lock()
 
 
 @app.middleware("http")
@@ -341,6 +344,9 @@ def create_browser_proxy(path: Path, destination: Path, job: dict[str, object]) 
     temporary = destination.with_name(
         f"{destination.stem}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp.mp4"
     )
+    with proxy_jobs_lock:
+        if job.get("status") == "canceled":
+            return
     duration = max(.1, media_duration(path))
     command = [
         get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-nostats", "-i", str(path),
@@ -353,6 +359,7 @@ def create_browser_proxy(path: Path, destination: Path, job: dict[str, object]) 
     try:
         trim_proxy_cache(path.stat().st_size, destination)
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        track_media_process(path, process)
         with proxy_jobs_lock:
             job["source"] = str(path)
             job["process"] = process
@@ -378,10 +385,13 @@ def create_browser_proxy(path: Path, destination: Path, job: dict[str, object]) 
         trim_proxy_cache(keep=destination)
         job.update({"status": "ready", "progress": 100, "error": None})
     except Exception as error:
-        job.update({"status": "failed", "error": str(error) or type(error).__name__})
+        if job.get("status") != "canceled":
+            job.update({"status": "failed", "error": str(error) or type(error).__name__})
     finally:
         if process and process.poll() is None:
             process.kill()
+        if process:
+            untrack_media_process(path, process)
         with proxy_jobs_lock:
             job.pop("process", None)
         temporary.unlink(missing_ok=True)
@@ -390,11 +400,14 @@ def create_browser_proxy(path: Path, destination: Path, job: dict[str, object]) 
 def cancel_proxy_work(paths: list[Path]) -> None:
     targets = {str(path.expanduser().resolve()) for path in paths}
     with proxy_jobs_lock:
-        processes = [
-            job.get("process") for job in proxy_jobs.values()
+        jobs = [
+            job for job in proxy_jobs.values()
             if job.get("source") in targets and job.get("status") in {"queued", "running"}
         ]
-    for process in processes:
+        for job in jobs:
+            job["status"] = "canceled"
+    for job in jobs:
+        process = job.get("process")
         if isinstance(process, subprocess.Popen) and process.poll() is None:
             process.kill()
 
@@ -418,7 +431,7 @@ def repair_video_file(path: Path) -> Path:
         errors: list[str] = []
         for command in commands:
             temporary.unlink(missing_ok=True)
-            result = subprocess.run(command, capture_output=True, text=True, timeout=600)
+            result = run_media_command(command, path, capture_output=True, text=True, timeout=600)
             if result.returncode == 0 and temporary.exists() and temporary.stat().st_size:
                 temporary.replace(destination)
                 return destination
@@ -432,6 +445,107 @@ def repair_video_file(path: Path) -> Path:
         raise ValueError("The video could not be remuxed. It may be truncated or use a damaged container.")
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def media_work_key(path: Path) -> str:
+    return str(path.expanduser().resolve())
+
+
+def open_media_stream(path: Path):
+    """Track a response file handle so a move or delete can release it on demand."""
+    stream = path.open("rb")
+    with active_streams_lock:
+        active_streams.setdefault(media_work_key(path), set()).add(stream)
+    return stream
+
+
+def close_media_stream(path: Path, stream) -> None:
+    key = media_work_key(path)
+    with active_streams_lock:
+        streams = active_streams.get(key)
+        if streams is not None:
+            streams.discard(stream)
+            if not streams:
+                active_streams.pop(key, None)
+    try:
+        stream.close()
+    except OSError:
+        pass
+
+
+def cancel_media_streams(paths: list[Path]) -> int:
+    keys = {media_work_key(path) for path in paths}
+    with active_streams_lock:
+        streams = [stream for key in keys for stream in active_streams.pop(key, set())]
+    for stream in streams:
+        try:
+            stream.close()
+        except OSError:
+            pass
+    return len(streams)
+
+
+def track_media_process(path: Path, process: subprocess.Popen) -> None:
+    with media_processes_lock:
+        media_processes.setdefault(media_work_key(path), set()).add(process)
+
+
+def untrack_media_process(path: Path, process: subprocess.Popen) -> None:
+    key = media_work_key(path)
+    with media_processes_lock:
+        processes = media_processes.get(key)
+        if processes is not None:
+            processes.discard(process)
+            if not processes:
+                media_processes.pop(key, None)
+
+
+def cancel_media_work(paths: list[Path]) -> int:
+    keys = {media_work_key(path) for path in paths}
+    with media_processes_lock:
+        processes = [process for key in keys for process in media_processes.pop(key, set())]
+    for process in processes:
+        if process.poll() is None:
+            process.kill()
+    for process in processes:
+        if process.poll() is None:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+    return len(processes)
+
+
+def run_media_command(
+    command: list[str], source: Path, *, timeout: float | None = None,
+    capture_output: bool = False, text: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run FFmpeg with its source file registered so file operations can cancel it."""
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE if capture_output else None,
+        stderr=subprocess.PIPE if capture_output else None,
+        text=text,
+    )
+    track_media_process(source, process)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        raise
+    finally:
+        untrack_media_process(source, process)
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, command, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def release_media_handles(paths: list[Path]) -> None:
+    """Stop preview streams, FFmpeg jobs, and proxy conversions that lock these files."""
+    cancel_proxy_work(paths)
+    cancel_media_work(paths)
+    cancel_media_streams(paths)
 
 
 def temporary_image_path(destination: Path) -> Path:
@@ -457,7 +571,7 @@ def extract_video_image(path: Path, destination: Path, seconds: float, scale: st
                 "-q:v", "4", "-y", str(temporary),
             ]
             try:
-                subprocess.run(command, check=True, timeout=timeout)
+                run_media_command(command, path, timeout=timeout)
                 if temporary.exists() and temporary.stat().st_size:
                     temporary.replace(destination)
                     return
@@ -501,7 +615,7 @@ def create_thumbnail(path: Path, destination: Path) -> None:
             get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", str(path),
             "-filter_complex", "showwavespic=s=640x320:colors=4cb3f0", "-frames:v", "1", "-y", str(temporary),
         ]
-        subprocess.run(command, check=True, timeout=30)
+        run_media_command(command, path, timeout=30)
     elif suffix == ".pdf":
         document = pymupdf.open(path)
         if not document.page_count:
@@ -537,8 +651,9 @@ def create_video_frame(path: Path, destination: Path, seconds: float) -> None:
 
 
 def media_duration(path: Path) -> float:
-    process = subprocess.run(
-        [get_ffmpeg_exe(), "-hide_banner", "-i", str(path)], capture_output=True, text=True, timeout=30,
+    process = run_media_command(
+        [get_ffmpeg_exe(), "-hide_banner", "-i", str(path)],
+        path, capture_output=True, text=True, timeout=30,
     )
     match = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", process.stderr)
     if not match:
@@ -579,19 +694,19 @@ def create_video_sprite(path: Path, destination: Path, count: int = 40) -> None:
         f"fps={count / duration:.8f},scale=160:90:force_original_aspect_ratio=decrease,"
         f"pad=160:90:(ow-iw)/2:(oh-ih)/2:color=black,tile={columns}x{rows}"
     )
-    subprocess.run([
+    run_media_command([
         get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", str(path),
         "-vf", filters, "-frames:v", "1", "-q:v", "5", "-y", str(temporary),
-    ], check=True, timeout=120)
+    ], path, timeout=120)
     temporary.replace(destination)
 
 
 def analyze_audio(path: Path) -> dict[str, object]:
     duration = media_duration(path)
-    pcm = subprocess.run([
+    pcm = run_media_command([
         get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", str(path),
         "-vn", "-ac", "1", "-ar", "100", "-f", "s16le", "-",
-    ], check=True, capture_output=True, timeout=120).stdout
+    ], path, capture_output=True, timeout=120).stdout
     values = array.array("h")
     values.frombytes(pcm[:len(pcm) - len(pcm) % 2])
     if sys.byteorder != "little":
@@ -603,10 +718,10 @@ def analyze_audio(path: Path) -> dict[str, object]:
         end = max(start + 1, (index + 1) * len(values) // bins)
         peak = max((abs(value) for value in values[start:end]), default=0)
         waveform.append(round(min(1, peak / 32768), 4))
-    silence_process = subprocess.run([
+    silence_process = run_media_command([
         get_ffmpeg_exe(), "-hide_banner", "-i", str(path), "-af", "silencedetect=noise=-35dB:d=0.7",
         "-f", "null", "-",
-    ], capture_output=True, text=True, timeout=120)
+    ], path, capture_output=True, text=True, timeout=120)
     starts = [float(value) for value in re.findall(r"silence_start:\s*([\d.]+)", silence_process.stderr)]
     ends = [float(value) for value in re.findall(r"silence_end:\s*([\d.]+)", silence_process.stderr)]
     if len(starts) > len(ends):
@@ -648,13 +763,13 @@ def video_temporal_fingerprint(path: Path) -> dict[str, object] | None:
         hashes: list[str] = []
         for ratio in (.04, .18, .34, .50, .66, .82, .96):
             seconds = max(0, min(max(0, duration - .05), duration * ratio))
-            frame = subprocess.run(
+            frame = run_media_command(
                 [
                     get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-ss", str(seconds),
                     "-i", str(path), "-map", "0:v:0", "-an", "-frames:v", "1",
                     "-vf", "scale=8:8,format=gray", "-f", "rawvideo", "pipe:1",
                 ],
-                capture_output=True, check=True, timeout=30,
+                path, capture_output=True, timeout=30,
             ).stdout
             if len(frame) != 64:
                 return None
@@ -906,15 +1021,21 @@ def list_directory(path: str = Query(default=str(Path.home())), show_hidden: boo
 
 
 def file_range(path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
-    with path.open("rb") as source:
+    source = open_media_stream(path)
+    try:
         source.seek(start)
         remaining = end - start + 1
         while remaining > 0:
-            chunk = source.read(min(chunk_size, remaining))
+            try:
+                chunk = source.read(min(chunk_size, remaining))
+            except (OSError, ValueError):
+                return
             if not chunk:
                 break
             remaining -= len(chunk)
             yield chunk
+    finally:
+        close_media_stream(path, source)
 
 
 def stream_path(file_path: Path, request: Request, media_type: str | None = None) -> Response:
@@ -1156,7 +1277,10 @@ def metadata(path: str) -> dict[str, object]:
             pass
     elif file_path.suffix.lower() in VIDEO_EXTENSIONS | AUDIO_EXTENSIONS:
         try:
-            probe = subprocess.run([get_ffmpeg_exe(), "-hide_banner", "-i", str(file_path)], text=True, capture_output=True, timeout=15)
+            probe = run_media_command(
+                [get_ffmpeg_exe(), "-hide_banner", "-i", str(file_path)],
+                file_path, text=True, capture_output=True, timeout=15,
+            )
             duration = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", probe.stderr)
             bitrate = re.search(r"bitrate:\s*(\d+\s*kb/s)", probe.stderr)
             video = re.search(r"Video:\s*([^,]+).*?(\d{2,5})x(\d{2,5})", probe.stderr)
@@ -1246,6 +1370,7 @@ def rename_files(request: RenameRequest) -> dict[str, object]:
         planned.append((source, target))
     renamed = []
     review_records = load_review()
+    release_media_handles(paths)
     try:
         for source, target in planned:
             source.rename(target)
@@ -1264,7 +1389,7 @@ def rename_files(request: RenameRequest) -> dict[str, object]:
 def move(request: MoveRequest) -> dict[str, object]:
     destination = Path(request.destination).expanduser().resolve()
     source_paths = [Path(value) for value in request.paths]
-    cancel_proxy_work(source_paths)
+    release_media_handles(source_paths)
     try:
         records = move_paths(source_paths, destination)
     except PermissionError as error:
@@ -1319,26 +1444,41 @@ def undo() -> dict[str, object]:
 @app.post("/api/trash")
 def trash(request: PathsRequest) -> dict[str, object]:
     paths = [checked_path(value) for value in request.paths]
-    cancel_proxy_work(paths)
+    release_media_handles(paths)
     review_records = load_review()
+    trashed = 0
+    locked: list[Path] = []
+    failures: list[tuple[Path, OSError]] = []
     for path in paths:
-        for attempt in range(12):
-            try:
-                send2trash(str(path))
-                break
-            except OSError as error:
-                locked = getattr(error, "winerror", None) == 32 or error.errno in {13, 16}
-                if not locked or attempt == 11:
-                    if getattr(error, "winerror", None) == 32:
-                        raise HTTPException(
-                            409,
-                            "Windows still has this file open. Pause it in other apps and close any Explorer preview pane, then retry.",
-                        ) from error
-                    raise
-                time.sleep(.08 * (attempt + 1))
+        try:
+            trash_with_lock_retry(path)
+        except OSError as error:
+            if getattr(error, "winerror", None) == 32:
+                locked.append(path)
+            else:
+                failures.append((path, error))
+            continue
         review_records.pop(str(path), None)
-    save_review(review_records)
-    return {"trashed": len(paths)}
+        trashed += 1
+    if trashed:
+        save_review(review_records)
+    if locked:
+        names = ", ".join(path.name for path in locked[:3])
+        raise HTTPException(
+            409,
+            f"Windows still has {names} open after several retries. Pause playback in other apps or close any "
+            "Explorer preview pane using the file, then retry.",
+        )
+    if failures:
+        path, error = failures[0]
+        if isinstance(error, PermissionError):
+            raise HTTPException(
+                403,
+                f"Windows denied permission to move {path.name} to the Recycle Bin. Check the drive or folder's "
+                "Security permissions.",
+            ) from error
+        raise HTTPException(409, f"{path.name} could not be moved to the Recycle Bin: {error}") from error
+    return {"trashed": trashed}
 
 
 @app.post("/api/reveal")
