@@ -1330,11 +1330,15 @@ function askToTrash() {
 
 async function trashSelected() {
   const paths = selectedItems().map((item) => item.path);
+  const releasedVideo = await releaseVideosForMove(paths);
   try {
     const result = await api("/api/trash", { method: "POST", body: JSON.stringify({ paths }) });
     showToast(`Moved ${result.trashed} item${result.trashed === 1 ? "" : "s"} to the Recycle Bin`);
     await loadFolder(state.currentPath);
-  } catch (error) { showToast(error.message); }
+  } catch (error) {
+    if (releasedVideo && state.primary) showPreview(state.primary);
+    showToast(error.message);
+  }
 }
 
 async function revealSelected() {

@@ -1265,9 +1265,23 @@ def undo() -> dict[str, object]:
 @app.post("/api/trash")
 def trash(request: PathsRequest) -> dict[str, object]:
     paths = [checked_path(value) for value in request.paths]
+    cancel_proxy_work(paths)
     review_records = load_review()
     for path in paths:
-        send2trash(str(path))
+        for attempt in range(12):
+            try:
+                send2trash(str(path))
+                break
+            except OSError as error:
+                locked = getattr(error, "winerror", None) == 32 or error.errno in {13, 16}
+                if not locked or attempt == 11:
+                    if getattr(error, "winerror", None) == 32:
+                        raise HTTPException(
+                            409,
+                            "Windows still has this file open. Pause it in other apps and close any Explorer preview pane, then retry.",
+                        ) from error
+                    raise
+                time.sleep(.08 * (attempt + 1))
         review_records.pop(str(path), None)
     save_review(review_records)
     return {"trashed": len(paths)}

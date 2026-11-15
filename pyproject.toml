@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quick-sort-player"
-version = "0.2.6"
+version = "0.2.7"
 description = "Fast local browser-based file sorter and pixel inspector"
 requires-python = ">=3.11"
 dependencies = [

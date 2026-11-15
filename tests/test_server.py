@@ -226,6 +226,27 @@ def test_move_retries_temporary_windows_file_lock(tmp_path: Path, monkeypatch):
     assert len(attempts) == 3
 
 
+def test_trash_retries_temporary_windows_file_lock(tmp_path: Path, monkeypatch):
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video")
+    attempts = []
+
+    class LockedFileError(PermissionError):
+        winerror = 32
+
+    def temporarily_locked(_path):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise LockedFileError(13, "file is being used by Python")
+
+    monkeypatch.setattr(server, "send2trash", temporarily_locked)
+    monkeypatch.setattr(server.time, "sleep", lambda _seconds: None)
+    response = client.post("/api/trash", json={"paths": [str(source)]})
+    assert response.status_code == 200
+    assert response.json()["trashed"] == 1
+    assert len(attempts) == 3
+
+
 def test_custom_shortcuts_are_persisted(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(server, "CONFIG_FILE", tmp_path / "config.json")
     response = client.put("/api/config", json={
