@@ -874,19 +874,43 @@ function updateSeekVisuals() {
   $("#seek").style.setProperty("--seek-buffered", `${Math.max(played, Math.min(100, buffered))}%`);
 }
 
+function positionSeekPreview(seconds, clientX) {
+  const rect = $("#seek").getBoundingClientRect();
+  const preview = $("#seek-preview");
+  preview.style.left = `${Math.max(83, Math.min(window.innerWidth - 83, clientX))}px`;
+  preview.style.top = `${Math.max(10, rect.top - 121)}px`;
+  $("#seek-preview-time").textContent = formatTime(seconds);
+  preview.classList.remove("hidden");
+  clearTimeout(state.seekPreviewTimer);
+  const path = state.primary.path;
+  state.seekPreviewTimer = setTimeout(() => {
+    if (state.primary?.path !== path) return;
+    const image = $("#seek-preview-image");
+    image.dataset.fallback = "";
+    image.src = endpoint("/api/video-frame", { path, time: Math.round(seconds * 2) / 2 });
+  }, 90);
+}
+
 function showSeekPreview(event) {
   if (!Number.isFinite(videoPreview.duration) || !videoPreview.duration || !state.primary) return;
   const rect = $("#seek").getBoundingClientRect();
   const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
-  const seconds = videoPreview.duration * ratio;
-  const preview = $("#seek-preview");
-  preview.style.left = `${ratio * 100}%`;
-  $("#seek-preview-time").textContent = formatTime(seconds);
-  preview.classList.remove("hidden");
-  clearTimeout(state.seekPreviewTimer);
-  state.seekPreviewTimer = setTimeout(() => {
-    $("#seek-preview-image").src = endpoint("/api/video-frame", { path: state.primary.path, time: Math.round(seconds * 2) / 2 });
-  }, 90);
+  positionSeekPreview(videoPreview.duration * ratio, event.clientX);
+}
+
+function scrubWithWheel(event) {
+  if (!Number.isFinite(videoPreview.duration) || !videoPreview.duration) return;
+  event.preventDefault();
+  const direction = Math.sign(event.deltaY || event.deltaX);
+  if (!direction) return;
+  const step = event.altKey ? 1 / 30 : event.shiftKey ? 30 : 5;
+  const target = Math.max(0, Math.min(videoPreview.duration, videoPreview.currentTime + direction * step));
+  if (event.shiftKey && typeof videoPreview.fastSeek === "function") videoPreview.fastSeek(target);
+  else videoPreview.currentTime = target;
+  $("#seek").value = Math.round(target / videoPreview.duration * 1000);
+  updateSeekVisuals();
+  const rect = $("#seek").getBoundingClientRect();
+  positionSeekPreview(target, rect.left + target / videoPreview.duration * rect.width);
 }
 
 function stepFrame(direction) {
@@ -1533,6 +1557,12 @@ function bindEvents() {
   $("#seek").addEventListener("pointermove", showSeekPreview);
   $("#seek").addEventListener("pointerleave", () => { clearTimeout(state.seekPreviewTimer); $("#seek-preview").classList.add("hidden"); });
   $("#seek").addEventListener("pointerdown", showSeekPreview);
+  $("#seek").addEventListener("wheel", scrubWithWheel, { passive: false });
+  $("#seek-preview-image").addEventListener("error", (event) => {
+    if (!state.primary || event.target.dataset.fallback === "true") return;
+    event.target.dataset.fallback = "true";
+    event.target.src = endpoint("/api/thumbnail", { path: state.primary.path });
+  });
   $("#search").addEventListener("input", (event) => {
     state.query = event.target.value;
     state.renderLimit = 180;

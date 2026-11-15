@@ -132,8 +132,7 @@
         <button id="back-10" class="transport-button">−10s</button>
         <button id="frame-back" class="transport-button" title="Previous frame">‹ Frame</button>
         <div id="timeline" class="timeline">
-          <input id="seek" type="range" min="0" max="1000" value="0" aria-label="Seek">
-          <div id="seek-preview" class="seek-preview hidden" aria-hidden="true"><img id="seek-preview-image" alt=""><span id="seek-preview-time">0:00</span></div>
+          <input id="seek" type="range" min="0" max="1000" value="0" aria-label="Seek" title="Wheel: 5s · Shift+wheel: 30s · Alt+wheel: one frame">
         </div>
         <span id="time-value" class="time-value">0:00 / 0:00</span>
         <button id="forward-10" class="transport-button">+10s</button>
@@ -155,6 +154,7 @@
         <button id="fullscreen-button" class="transport-button" title="Fullscreen">Full</button>
         <span class="quality-badge" title="The original local file is played without transcoding">Original</span>
       </section>
+      <div id="seek-preview" class="seek-preview hidden" aria-hidden="true"><img id="seek-preview-image" alt="Scrubber frame preview"><span id="seek-preview-time">0:00</span></div>
 
       <footer id="action-bar" class="action-bar hidden">
         <div class="action-selection"><span id="selection-count">1 selected</span></div>
