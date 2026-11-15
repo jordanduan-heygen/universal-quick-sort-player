@@ -261,10 +261,12 @@ def common_locations(config: dict[str, object] | None = None) -> list[dict[str, 
         for name, path, hotkey in candidates if path.exists()
     ]
     if sys.platform == "win32":
-        locations.extend({
-            "name": f"{drive.drive or str(drive).rstrip('\\')} Drive", "path": str(drive),
-            "hotkey": "", "source": "drive", "available": drive.exists(),
-        } for drive in windows_drives())
+        for drive in windows_drives():
+            drive_name = drive.drive or str(drive).rstrip("\\")
+            locations.append({
+                "name": f"{drive_name} Drive", "path": str(drive),
+                "hotkey": "", "source": "drive", "available": drive.exists(),
+            })
     seen = {os.path.normcase(os.path.normpath(str(location["path"]))) for location in locations}
     for saved in (config or {}).get("saved_locations", []):
         if not isinstance(saved, dict) or not saved.get("path"):
