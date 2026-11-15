@@ -173,6 +173,7 @@ body.files-collapsed .browser-pane { display: none; }
 .filmstrip { height: 72px; display: flex; gap: 6px; padding: 7px 16px 0; overflow-x: auto; }
 .filmstrip button { min-width: 112px; height: 64px; overflow: hidden; border: 0; border-radius: 7px; padding: 0; background: #080808; cursor: pointer; }
 .filmstrip img { width: 100%; height: 100%; object-fit: cover; }
+.filmstrip .frame-sprite { display: block; width: 100%; height: 100%; background-color: #101010; background-repeat: no-repeat; }
 .filmstrip button.frame-failed::after { content: "Preview unavailable"; display: grid; place-items: center; height: 100%; padding: 6px; color: var(--muted); font-size: 11px; }
 .empty-preview, .file-preview { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; padding: 40px; text-align: center; }
 .empty-preview h3, .file-preview strong { margin: 20px 0 0; font-size: 18px; font-weight: 500; }

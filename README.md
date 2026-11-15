@@ -17,6 +17,7 @@ pixel level. The app binds to `127.0.0.1` only: files never leave your computer.
 - Per-video resume positions, timeline bookmarks, and In/Out range looping
 - Cached audio waveforms with detected silence regions, plus sprite-sheet hover previews for long videos
 - Seekable byte-range streaming for multi-gigabyte local videos, with heavy preview analysis deferred so playback gets drive priority
+- Automatic browser-compatible H.264/AAC playback proxies for unsupported containers/codecs; originals stay untouched and the proxy cache self-limits to 8 GB
 - Configurable, renameable one-key moves (up to nine) with native folder pickers and drag-and-drop
 - Auto-advance after sorting and Shift-click range selection
 - Ordered fullscreen review: numbered sort keys advance to the next image/video in the visible queue, and `Ctrl+Z` restores and reselects mistaken moves

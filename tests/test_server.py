@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -66,6 +67,44 @@ def test_media_supports_seekable_byte_ranges(tmp_path: Path):
 
     invalid = client.get("/api/media", params={"path": str(video)}, headers={"Range": "bytes=20-30"})
     assert invalid.status_code == 416
+
+
+def test_cached_browser_proxy_is_seekable(tmp_path: Path, monkeypatch):
+    video = tmp_path / "unsupported.mov"
+    video.write_bytes(b"original-video")
+    monkeypatch.setattr(server, "PROXY_DIR", tmp_path / "proxies")
+    proxy = server.browser_proxy_path(video)
+    proxy.parent.mkdir()
+    proxy.write_bytes(b"browser-compatible-video")
+
+    started = client.post("/api/browser-proxy/start", json={"path": str(video)})
+    assert started.json() == {"status": "ready", "progress": 100, "error": None}
+    response = client.get(
+        "/api/browser-proxy/file", params={"path": str(video)}, headers={"Range": "bytes=8-17"},
+    )
+    assert response.status_code == 206
+    assert response.content == b"compatible"
+    assert response.headers["content-type"].startswith("video/mp4")
+
+
+def test_temporal_video_match_rejects_shared_intro():
+    same_intro = "0000000000000000"
+    left = {"duration": 60, "hashes": [same_intro, *["0000000000000000"] * 6]}
+    different_after_intro = {"duration": 60, "hashes": [same_intro, *["ffffffffffffffff"] * 6]}
+    close_copy = {"duration": 60.5, "hashes": ["0000000000000001"] * 7}
+    assert server.temporal_video_fingerprints_match(left, different_after_intro) is False
+    assert server.temporal_video_fingerprints_match(left, close_copy) is True
+
+
+def test_windows_reveal_selects_exact_file(tmp_path: Path, monkeypatch):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    commands = []
+    monkeypatch.setattr(server.sys, "platform", "win32")
+    monkeypatch.setattr(server.subprocess, "Popen", lambda command: commands.append(command))
+    response = client.post("/api/reveal", json={"path": str(video)})
+    assert response.status_code == 200
+    assert commands == [["explorer.exe", f"/select,{video}"]]
 
 
 def test_review_state_round_trip(tmp_path: Path, monkeypatch):
@@ -147,6 +186,19 @@ def test_move_and_undo_returns_restored_paths(tmp_path: Path):
     undone = client.post("/api/undo", json={}).json()
     assert undone["paths"] == [str(source)]
     assert source.exists()
+
+
+def test_move_reports_windows_disk_full_clearly(tmp_path: Path, monkeypatch):
+    source = tmp_path / "large.mp4"
+    source.write_bytes(b"video")
+    destination = tmp_path / "destination"
+    monkeypatch.setattr(server, "move_paths", lambda _paths, _destination: (_ for _ in ()).throw(OSError(28, "disk full")))
+    monkeypatch.setattr(server, "required_copy_space", lambda _paths, _destination: 5 * 1024**3)
+    monkeypatch.setattr(server.shutil, "disk_usage", lambda _path: shutil._ntuple_diskusage(10 * 1024**3, 9 * 1024**3, 1 * 1024**3))
+    response = client.post("/api/move", json={"paths": [str(source)], "destination": str(destination)})
+    assert response.status_code == 507
+    assert "needs about 5.00 GB" in response.json()["detail"]
+    assert "only 1.00 GB" in response.json()["detail"]
 
 
 def test_custom_shortcuts_are_persisted(tmp_path: Path, monkeypatch):

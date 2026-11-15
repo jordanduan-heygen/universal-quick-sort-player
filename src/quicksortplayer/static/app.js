@@ -35,6 +35,7 @@ const state = {
   duplicateNotified: new Set(),
   duplicateCompareGroup: null,
   duplicateCompareZoom: 1,
+  duplicateSyncing: false,
   locationTree: new Map(),
   expandedLocations: new Set(),
   preloadedNextPath: null,
@@ -47,6 +48,8 @@ const state = {
   scrub: JSON.parse(localStorage.getItem("quick-sort-scrub") || '{"normal":5,"fast":30,"fine":1}'),
   enhancementTimer: null,
   enhancedPath: null,
+  proxyAttemptPath: null,
+  filmstripSprites: new Map(),
 };
 
 const LARGE_MEDIA_BYTES = 512 * 1024 * 1024;
@@ -835,6 +838,9 @@ function resetPreviewElements() {
   clearTimeout(state.enhancementTimer);
   state.enhancementTimer = null;
   state.enhancedPath = null;
+  state.proxyAttemptPath = null;
+  delete videoPreview.dataset.sourcePath;
+  delete videoPreview.dataset.browserProxy;
   state.audioAnalysis = null;
   state.sprite = null;
   drawWaveform();
@@ -874,6 +880,7 @@ function showPreview(item) {
     videoPreview.classList.toggle("audio-player", item.preview_type === "audio");
     if (item.preview_type === "audio") videoPreview.poster = endpoint("/api/thumbnail", { path: item.path });
     else videoPreview.removeAttribute("poster");
+    videoPreview.dataset.sourcePath = item.path;
     videoPreview.src = endpoint("/api/media", { path: item.path });
     videoPreview.classList.remove("hidden");
     $("#transport").classList.remove("hidden");
@@ -889,6 +896,35 @@ function showPreview(item) {
   }
   updateActionBar();
   preloadNextVideo();
+}
+
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function recoverUnsupportedVideo(item) {
+  if (!item || item.preview_type !== "video" || state.proxyAttemptPath === item.path) return;
+  state.proxyAttemptPath = item.path;
+  showToast("Preparing browser-compatible playback… 0%");
+  try {
+    let job = await api("/api/browser-proxy/start", {
+      method: "POST",
+      body: JSON.stringify({ path: item.path }),
+    });
+    while (["queued", "running"].includes(job.status)) {
+      if (state.primary?.path !== item.path) return;
+      showToast(`Preparing browser-compatible playback… ${job.progress || 0}%`);
+      await wait(1000);
+      job = await api(endpoint("/api/browser-proxy/status", { path: item.path }));
+    }
+    if (job.status !== "ready") throw new Error(job.error || "The browser-compatible copy could not be created");
+    if (state.primary?.path !== item.path) return;
+    videoPreview.dataset.browserProxy = "true";
+    videoPreview.src = endpoint("/api/browser-proxy/file", { path: item.path });
+    videoPreview.load();
+    await videoPreview.play();
+    showToast("Playing a browser-compatible copy. The original file is unchanged.");
+  } catch (error) {
+    if (state.primary?.path === item.path) showToast(`${error.message}. Use Tools → Open externally.`);
+  }
 }
 
 async function showTextualPreview(item) {
@@ -935,31 +971,48 @@ async function updateReview(changes, { advance = false } = {}) {
   } catch (error) { showToast(error.message); }
 }
 
-function buildFilmstrip() {
+async function cachedFilmstripSprite(path, signal) {
+  if (state.filmstripSprites.has(path)) return state.filmstripSprites.get(path);
+  const response = await fetch(endpoint("/api/video-sprite", { path, count: 10 }), { signal });
+  if (!response.ok) throw new Error("Sprite generation failed");
+  const url = URL.createObjectURL(await response.blob());
+  state.filmstripSprites.set(path, url);
+  while (state.filmstripSprites.size > 4) {
+    const [oldPath, oldUrl] = state.filmstripSprites.entries().next().value;
+    state.filmstripSprites.delete(oldPath);
+    URL.revokeObjectURL(oldUrl);
+  }
+  return url;
+}
+
+async function buildFilmstrip() {
   if (!state.primary || !state.primary.kind.toLowerCase().includes("video") || !Number.isFinite(videoPreview.duration) || !videoPreview.duration) return;
+  const filmstripPath = state.primary.path;
   const times = Array.from({ length: 10 }, (_, index) => {
     const ratio = index / 9 * .98;
     return Math.max(0, videoPreview.duration * ratio);
   });
-  const large = state.primary.size >= LARGE_MEDIA_BYTES;
   $("#filmstrip").innerHTML = times.map((seconds) => `
-    <button data-film-time="${seconds}" title="${formatTime(seconds)}"><img loading="lazy" ${large ? "" : `src="${endpoint("/api/video-frame", { path: state.primary.path, time: seconds })}"`} data-frame-src="${endpoint("/api/video-frame", { path: state.primary.path, time: seconds })}" alt="Frame at ${formatTime(seconds)}"></button>
+    <button data-film-time="${seconds}" title="${formatTime(seconds)}"><span class="frame-sprite" role="img" aria-label="Frame at ${formatTime(seconds)}"></span></button>
   `).join("");
   $("#filmstrip").classList.remove("hidden");
   $$("#filmstrip [data-film-time]").forEach((button) => button.addEventListener("click", () => { videoPreview.currentTime = Number(button.dataset.filmTime); }));
-  const filmstripPath = state.primary.path;
-  $$("#filmstrip img").forEach((image) => image.addEventListener("error", () => {
-    if (image.dataset.usedFallback === "true") {
-      image.closest("button")?.classList.add("frame-failed");
-      image.removeAttribute("src");
-      return;
-    }
-    image.dataset.usedFallback = "true";
-    image.src = endpoint("/api/thumbnail", { path: filmstripPath });
-  }));
-  if (large) $$("#filmstrip img").forEach((image, index) => setTimeout(() => {
-    if (state.primary?.path === filmstripPath && image.isConnected && !image.getAttribute("src")) image.src = image.dataset.frameSrc;
-  }, 500 + index * 350));
+  try {
+    const spriteUrl = await cachedFilmstripSprite(filmstripPath);
+    if (state.primary?.path !== filmstripPath) return;
+    $$("#filmstrip .frame-sprite").forEach((frame, index) => {
+      frame.style.backgroundImage = `url("${spriteUrl}")`;
+      frame.style.backgroundSize = "1000% 100%";
+      frame.style.backgroundPosition = `${index / 9 * 100}% 0`;
+    });
+  } catch (_) {
+    if (state.primary?.path !== filmstripPath) return;
+    $$("#filmstrip .frame-sprite").forEach((frame, index) => {
+      frame.style.backgroundImage = `url("${endpoint("/api/video-frame", { path: filmstripPath, time: times[index] })}")`;
+      frame.style.backgroundSize = "cover";
+      frame.style.backgroundPosition = "center";
+    });
+  }
 }
 
 function scheduleMediaEnhancements(item) {
@@ -1002,15 +1055,18 @@ function preloadNextVideo() {
   const controller = new AbortController();
   state.preloadController = controller;
   nextVideoPreload.src = endpoint("/api/media", { path: next.path });
-  nextVideoPreload.preload = "metadata";
+  nextVideoPreload.preload = "auto";
   nextVideoPreload.load();
-  nextVideoPreload.addEventListener("loadedmetadata", async () => {
-    if (state.preloadedNextPath !== next.path || controller.signal.aborted || !Number.isFinite(nextVideoPreload.duration)) return;
-    if (next.size >= LARGE_MEDIA_BYTES) return;
-    const times = Array.from({ length: 10 }, (_, index) => nextVideoPreload.duration * (index / 9 * .98));
-    for (let index = 0; index < times.length; index += 2) {
-      if (controller.signal.aborted) return;
-      await Promise.allSettled(times.slice(index, index + 2).map((time) => fetch(endpoint("/api/video-frame", { path: next.path, time }), { signal: controller.signal, cache: "force-cache" })));
+  cachedFilmstripSprite(next.path, controller.signal).catch(() => {});
+  api(endpoint("/api/metadata", { path: next.path })).then((metadata) => {
+    if (controller.signal.aborted || state.preloadedNextPath !== next.path) return;
+    const codec = String(metadata.video_codec || "").toLowerCase();
+    const needsProxy = /hevc|h\.265|prores|dnx|mpeg-?2|mpeg-?4/.test(codec) || [".mkv", ".avi", ".wmv", ".flv"].includes(next.extension);
+    if (needsProxy) api("/api/browser-proxy/start", { method: "POST", body: JSON.stringify({ path: next.path }) }).catch(() => {});
+  }).catch(() => {});
+  nextVideoPreload.addEventListener("error", () => {
+    if (!controller.signal.aborted && state.preloadedNextPath === next.path) {
+      api("/api/browser-proxy/start", { method: "POST", body: JSON.stringify({ path: next.path }) }).catch(() => {});
     }
   }, { once: true });
 }
@@ -1372,7 +1428,7 @@ async function openDuplicateComparison(groupIndex, focusIndex = 0) {
   $("#duplicate-compare-summary").textContent = `${label} · ${group.confidence}% match · compare quality before choosing a keeper`;
   $("#duplicate-compare-grid").innerHTML = group.files.map((file, index) => {
     const media = file.category === "videos"
-      ? `<video src="${endpoint("/api/media", { path: file.path })}" muted loop playsinline preload="metadata"></video>`
+      ? `<video src="${endpoint("/api/media", { path: file.path })}" data-source-path="${escapeHtml(file.path)}" controls muted loop playsinline preload="metadata"></video><span class="duplicate-video-status hidden"></span>`
       : `<img src="${endpoint(file.browser_native === false ? "/api/rendered-image" : "/api/media", { path: file.path })}" alt="${escapeHtml(file.name)}">`;
     return `<article class="duplicate-compare-card ${file.path === group.keeper ? "recommended" : ""}" data-duplicate-compare-card="${index}">
       <div class="duplicate-compare-media">${media}</div>
@@ -1389,6 +1445,8 @@ async function openDuplicateComparison(groupIndex, focusIndex = 0) {
   $$('[data-keep-duplicate]').forEach((button) => button.addEventListener("click", () => chooseDuplicateKeeper(groupIndex, Number(button.dataset.keepDuplicate))));
   $$('[data-remove-duplicate]').forEach((button) => button.addEventListener("click", () => toggleDuplicateRemoval(groupIndex, Number(button.dataset.removeDuplicate))));
   const videos = $$("#duplicate-compare-grid video");
+  bindSynchronizedDuplicateVideos(videos);
+  videos.forEach((video) => video.addEventListener("error", () => recoverDuplicateVideo(video, video.dataset.sourcePath)));
   videos[0]?.addEventListener("timeupdate", () => {
     if (Number.isFinite(videos[0].duration) && videos[0].duration) $("#duplicate-compare-seek").value = Math.round(videos[0].currentTime / videos[0].duration * 1000);
   });
@@ -1396,6 +1454,61 @@ async function openDuplicateComparison(groupIndex, focusIndex = 0) {
   requestAnimationFrame(() => $(`[data-duplicate-compare-card="${focusIndex}"]`)?.scrollIntoView({ inline: "center", block: "nearest" }));
   const metadata = await Promise.all(group.files.map((file) => api(endpoint("/api/metadata", { path: file.path })).catch(() => ({}))));
   renderDuplicateComparisonMetadata(groupIndex, metadata);
+}
+
+function withDuplicateSync(callback) {
+  if (state.duplicateSyncing) return;
+  state.duplicateSyncing = true;
+  callback();
+  requestAnimationFrame(() => { state.duplicateSyncing = false; });
+}
+
+function bindSynchronizedDuplicateVideos(videos) {
+  videos.forEach((source) => {
+    source.addEventListener("play", () => withDuplicateSync(() => {
+      const ratio = source.duration ? source.currentTime / source.duration : 0;
+      videos.forEach((video) => {
+        if (video === source) return;
+        if (Number.isFinite(video.duration) && video.duration) video.currentTime = ratio * video.duration;
+        video.play().catch(() => {});
+      });
+      $("#duplicate-compare-play").textContent = "Pause all";
+    }));
+    source.addEventListener("pause", () => withDuplicateSync(() => {
+      videos.forEach((video) => { if (video !== source) video.pause(); });
+      $("#duplicate-compare-play").textContent = "Play all";
+    }));
+    source.addEventListener("seeking", () => withDuplicateSync(() => {
+      if (!Number.isFinite(source.duration) || !source.duration) return;
+      const ratio = source.currentTime / source.duration;
+      videos.forEach((video) => {
+        if (video !== source && Number.isFinite(video.duration) && video.duration) video.currentTime = ratio * video.duration;
+      });
+    }));
+  });
+}
+
+async function recoverDuplicateVideo(video, path) {
+  if (!path || video.dataset.browserProxy === "true" || video.dataset.proxyPreparing === "true") return;
+  video.dataset.proxyPreparing = "true";
+  const status = video.parentElement.querySelector(".duplicate-video-status");
+  status?.classList.remove("hidden");
+  try {
+    let job = await api("/api/browser-proxy/start", { method: "POST", body: JSON.stringify({ path }) });
+    while (["queued", "running"].includes(job.status) && video.isConnected) {
+      if (status) status.textContent = `Preparing compatible player… ${job.progress || 0}%`;
+      await wait(1000);
+      job = await api(endpoint("/api/browser-proxy/status", { path }));
+    }
+    if (!video.isConnected) return;
+    if (job.status !== "ready") throw new Error(job.error || "Conversion failed");
+    video.dataset.browserProxy = "true";
+    video.src = endpoint("/api/browser-proxy/file", { path });
+    video.load();
+    status?.classList.add("hidden");
+  } catch (error) {
+    if (status) status.textContent = `${error.message}. Open externally to compare this file.`;
+  }
 }
 
 function chooseDuplicateKeeper(groupIndex, keeperIndex, { quiet = false, selectOthers = true } = {}) {
@@ -1966,7 +2079,13 @@ function bindEvents() {
   });
   videoPreview.addEventListener("canplay", () => scheduleMediaEnhancements(state.primary));
   videoPreview.addEventListener("error", () => {
-    if (state.primary?.preview_type === "video") showToast("This codec cannot play in the browser. Use Tools → Open externally for the original file.");
+    const item = state.primary;
+    if (item?.preview_type !== "video" || videoPreview.dataset.sourcePath !== item.path) return;
+    if (videoPreview.dataset.browserProxy === "true") {
+      showToast("The browser-compatible copy could not play. Use Tools → Open externally.");
+      return;
+    }
+    recoverUnsupportedVideo(item);
   });
   videoPreview.addEventListener("timeupdate", () => {
     const record = currentMediaState();

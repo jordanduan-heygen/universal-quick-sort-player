@@ -50,9 +50,45 @@ def collision_safe_path(destination: Path) -> Path:
     raise RuntimeError(f"Could not find a free filename near {destination}")
 
 
+def path_size(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    total = 0
+    for child in path.rglob("*"):
+        try:
+            if child.is_file():
+                total += child.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def required_copy_space(paths: Iterable[Path], destination_dir: Path) -> int:
+    """Return bytes needed for cross-volume moves; same-volume renames need no copy space."""
+    destination_device = destination_dir.stat().st_dev
+    destination_drive = destination_dir.drive.casefold()
+    required = 0
+    for source in paths:
+        source = source.expanduser().resolve()
+        try:
+            cross_volume = source.stat().st_dev != destination_device
+            if source.drive and destination_drive:
+                cross_volume = source.drive.casefold() != destination_drive
+            if cross_volume:
+                required += path_size(source)
+        except OSError:
+            continue
+    return required
+
+
 def move_paths(paths: Iterable[Path], destination_dir: Path) -> list[MoveRecord]:
+    paths = list(paths)
     destination_dir = destination_dir.expanduser().resolve()
     destination_dir.mkdir(parents=True, exist_ok=True)
+    required = required_copy_space(paths, destination_dir)
+    free = shutil.disk_usage(destination_dir).free
+    if required > free:
+        raise OSError(28, f"Destination needs {required} bytes but only {free} bytes are free")
     records: list[MoveRecord] = []
     for raw_path in paths:
         source = raw_path.expanduser().resolve()

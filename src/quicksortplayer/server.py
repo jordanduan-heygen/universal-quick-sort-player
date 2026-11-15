@@ -28,7 +28,10 @@ from pydantic import BaseModel
 from send2trash import send2trash
 from starlette.concurrency import run_in_threadpool
 
-from .file_ops import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MoveRecord, category_for, move_paths, undo_moves
+from .file_ops import (
+    AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MoveRecord, category_for,
+    move_paths, path_size, required_copy_space, undo_moves,
+)
 
 
 APP_STARTED = str(time.time_ns())
@@ -36,9 +39,12 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = PACKAGE_DIR / "static"
 STATE_DIR = Path(os.environ.get("QUICK_SORT_STATE_DIR", Path.home() / ".quick-sort-player"))
 THUMB_DIR = STATE_DIR / "thumbnails"
+PROXY_DIR = STATE_DIR / "browser-proxies"
 CONFIG_FILE = STATE_DIR / "config.json"
 REVIEW_FILE = STATE_DIR / "review.json"
 MAX_THUMB_EDGE = 320
+MAX_PROXY_CACHE_BYTES = 8 * 1024**3
+MIN_PROXY_FREE_BYTES = 2 * 1024**3
 TEXT_EXTENSIONS = {
     ".bat", ".c", ".cc", ".cfg", ".conf", ".cpp", ".cs", ".css", ".csv", ".env", ".go", ".h", ".hpp",
     ".html", ".ini", ".java", ".js", ".json", ".jsx", ".log", ".lua", ".md", ".mjs", ".php", ".plist",
@@ -54,6 +60,8 @@ undo_stack: list[list[MoveRecord]] = []
 index_jobs: dict[str, dict[str, object]] = {}
 duplicate_jobs: dict[str, dict[str, object]] = {}
 duplicate_jobs_lock = threading.Lock()
+proxy_jobs: dict[str, dict[str, object]] = {}
+proxy_jobs_lock = threading.Lock()
 
 
 @app.middleware("http")
@@ -292,6 +300,80 @@ def thumb_cache_path(path: Path, marker: str = "thumb") -> Path:
     return THUMB_DIR / f"{digest}.jpg"
 
 
+def browser_proxy_path(path: Path) -> Path:
+    stat = path.stat()
+    digest = hashlib.sha256(f"{path}:{stat.st_mtime_ns}:{stat.st_size}:h264-aac-v1".encode()).hexdigest()
+    return PROXY_DIR / f"{digest}.mp4"
+
+
+def proxy_job_snapshot(job: dict[str, object]) -> dict[str, object]:
+    return {
+        "status": job.get("status", "queued"),
+        "progress": job.get("progress", 0),
+        "error": job.get("error"),
+    }
+
+
+def trim_proxy_cache(incoming_bytes: int = 0, keep: Path | None = None) -> None:
+    PROXY_DIR.mkdir(parents=True, exist_ok=True)
+    files = sorted(
+        (path for path in PROXY_DIR.glob("*.mp4") if path != keep),
+        key=lambda path: path.stat().st_mtime,
+    )
+    total = sum(path.stat().st_size for path in files) + (keep.stat().st_size if keep and keep.exists() else 0)
+    free = shutil.disk_usage(PROXY_DIR).free
+    target_free = MIN_PROXY_FREE_BYTES + incoming_bytes
+    while files and (total + incoming_bytes > MAX_PROXY_CACHE_BYTES or free < target_free):
+        oldest = files.pop(0)
+        size = oldest.stat().st_size
+        oldest.unlink(missing_ok=True)
+        total -= size
+        free += size
+    if free < min(target_free, incoming_bytes + 512 * 1024**2):
+        raise OSError(28, "Not enough free space for a browser-compatible playback copy")
+
+
+def create_browser_proxy(path: Path, destination: Path, job: dict[str, object]) -> None:
+    PROXY_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f"{destination.stem}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp.mp4"
+    )
+    duration = max(.1, media_duration(path))
+    command = [
+        get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-nostats", "-i", str(path),
+        "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast",
+        "-crf", "20", "-profile:v", "main", "-pix_fmt", "yuv420p", "-tag:v", "avc1",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", "-progress", "pipe:1", "-y", str(temporary),
+    ]
+    process: subprocess.Popen[str] | None = None
+    try:
+        trim_proxy_cache(path.stat().st_size, destination)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        job["status"] = "running"
+        assert process.stdout is not None
+        for line in process.stdout:
+            key, _, raw_value = line.strip().partition("=")
+            if key in {"out_time_us", "out_time_ms"}:
+                try:
+                    # Modern FFmpeg reports microseconds for both fields.
+                    job["progress"] = min(99, round(float(raw_value) / 1_000_000 / duration * 100))
+                except ValueError:
+                    pass
+        stderr = process.stderr.read() if process.stderr else ""
+        if process.wait() != 0 or not temporary.exists() or not temporary.stat().st_size:
+            raise RuntimeError(stderr.strip() or "FFmpeg could not create a browser-compatible video")
+        temporary.replace(destination)
+        trim_proxy_cache(keep=destination)
+        job.update({"status": "ready", "progress": 100, "error": None})
+    except Exception as error:
+        job.update({"status": "failed", "error": str(error) or type(error).__name__})
+    finally:
+        if process and process.poll() is None:
+            process.kill()
+        temporary.unlink(missing_ok=True)
+
+
 def temporary_image_path(destination: Path) -> Path:
     return destination.with_name(
         f"{destination.stem}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp.jpg"
@@ -409,7 +491,7 @@ def create_video_sprite(path: Path, destination: Path, count: int = 40) -> None:
     duration = max(.1, media_duration(path))
     columns = 10
     rows = max(1, (count + columns - 1) // columns)
-    temporary = destination.with_suffix(".tmp.jpg")
+    temporary = temporary_image_path(destination)
     filters = (
         f"fps={count / duration:.8f},scale=160:90:force_original_aspect_ratio=decrease,"
         f"pad=160:90:(ow-iw)/2:(oh-ih)/2:color=black,tile={columns}x{rows}"
@@ -471,23 +553,38 @@ def perceptual_hash(path: Path) -> str | None:
         return None
 
 
-def video_perceptual_hash(path: Path) -> str | None:
-    """Return a tiny visual fingerprint from an early representative frame."""
+def video_temporal_fingerprint(path: Path) -> dict[str, object] | None:
+    """Fingerprint frames across the full timeline so shared intros do not create false matches."""
+    cache = thumb_cache_path(path, "video-temporal-fingerprint-v2").with_suffix(".json")
     try:
-        frame = subprocess.run(
-            [
-                get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-ss", "1",
-                "-i", str(path), "-frames:v", "1", "-vf", "scale=8:8,format=gray",
-                "-f", "rawvideo", "pipe:1",
-            ],
-            capture_output=True, check=True, timeout=30,
-        ).stdout
-        if len(frame) != 64:
-            return None
-        average = sum(frame) / len(frame)
-        bits = "".join("1" if value >= average else "0" for value in frame)
-        return f"{int(bits, 2):016x}"
-    except (OSError, subprocess.SubprocessError):
+        if cache.exists():
+            cached = json.loads(cache.read_text(encoding="utf-8"))
+            if isinstance(cached, dict) and len(cached.get("hashes", [])) == 7:
+                return cached
+        duration = media_duration(path)
+        hashes: list[str] = []
+        for ratio in (.04, .18, .34, .50, .66, .82, .96):
+            seconds = max(0, min(max(0, duration - .05), duration * ratio))
+            frame = subprocess.run(
+                [
+                    get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-ss", str(seconds),
+                    "-i", str(path), "-map", "0:v:0", "-an", "-frames:v", "1",
+                    "-vf", "scale=8:8,format=gray", "-f", "rawvideo", "pipe:1",
+                ],
+                capture_output=True, check=True, timeout=30,
+            ).stdout
+            if len(frame) != 64:
+                return None
+            average = sum(frame) / len(frame)
+            bits = "".join("1" if value >= average else "0" for value in frame)
+            hashes.append(f"{int(bits, 2):016x}")
+        result: dict[str, object] = {"duration": duration, "hashes": hashes}
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache.with_name(f"{cache.stem}.{time.time_ns()}.tmp.json")
+        temporary.write_text(json.dumps(result), encoding="utf-8")
+        temporary.replace(cache)
+        return result
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
         return None
 
 
@@ -525,6 +622,37 @@ def visual_groups(paths: list[Path], fingerprint_fn, threshold: int) -> list[lis
     return [group for _, group in clusters if len(group) > 1]
 
 
+def temporal_video_fingerprints_match(left: dict[str, object], right: dict[str, object]) -> bool:
+    left_duration = float(left.get("duration", 0))
+    right_duration = float(right.get("duration", 0))
+    if not left_duration or not right_duration:
+        return False
+    duration_delta = abs(left_duration - right_duration)
+    if duration_delta > max(1.5, min(left_duration, right_duration) * .04):
+        return False
+    left_hashes = [int(value, 16) for value in left.get("hashes", [])]
+    right_hashes = [int(value, 16) for value in right.get("hashes", [])]
+    if len(left_hashes) != 7 or len(right_hashes) != 7:
+        return False
+    distances = [(left_value ^ right_value).bit_count() for left_value, right_value in zip(left_hashes, right_hashes)]
+    # At least six timeline regions must agree; one shared intro or outro is not enough.
+    return sum(distance <= 10 for distance in distances) >= 6 and sum(distances) / len(distances) <= 8
+
+
+def temporal_video_groups(paths: list[Path]) -> list[list[Path]]:
+    clusters: list[tuple[dict[str, object], list[Path]]] = []
+    for path in paths:
+        fingerprint = video_temporal_fingerprint(path)
+        if not fingerprint:
+            continue
+        cluster = next((group for representative, group in clusters if temporal_video_fingerprints_match(representative, fingerprint)), None)
+        if cluster is None:
+            clusters.append((fingerprint, [path]))
+        else:
+            cluster.append(path)
+    return [group for _, group in clusters if len(group) > 1]
+
+
 def find_duplicates(folder: Path) -> dict[str, object]:
     files = [path for path in folder.iterdir() if path.is_file()]
     by_size: dict[int, list[Path]] = {}
@@ -547,7 +675,7 @@ def find_duplicates(folder: Path) -> dict[str, object]:
     images = [path for path in files if path.suffix.lower() in IMAGE_EXTENSIONS][:500]
     videos = [path for path in files if path.suffix.lower() in VIDEO_EXTENSIONS][:200]
     visual_paths = visual_groups(images, perceptual_hash, 6)
-    video_paths = visual_groups(videos, video_perceptual_hash, 4)
+    video_paths = temporal_video_groups(videos)
     exact_sets = [set(group) for group in exact_paths]
 
     def is_only_exact(group: list[Path]) -> bool:
@@ -706,10 +834,8 @@ def file_range(path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
             yield chunk
 
 
-@app.api_route("/api/media", methods=["GET", "HEAD"])
-def media(path: str, request: Request) -> Response:
-    file_path = checked_path(path, require_file=True)
-    media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+def stream_path(file_path: Path, request: Request, media_type: str | None = None) -> Response:
+    media_type = media_type or mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
     size = file_path.stat().st_size
     start, end = 0, max(0, size - 1)
     status_code = 200
@@ -739,6 +865,50 @@ def media(path: str, request: Request) -> Response:
     if request.method == "HEAD":
         return Response(status_code=status_code, media_type=media_type, headers=headers)
     return StreamingResponse(file_range(file_path, start, end), status_code=status_code, media_type=media_type, headers=headers)
+
+
+@app.api_route("/api/media", methods=["GET", "HEAD"])
+def media(path: str, request: Request) -> Response:
+    return stream_path(checked_path(path, require_file=True), request)
+
+
+@app.post("/api/browser-proxy/start")
+def start_browser_proxy(request: RevealRequest) -> dict[str, object]:
+    file_path = checked_path(request.path, require_file=True)
+    if file_path.suffix.lower() not in VIDEO_EXTENSIONS:
+        raise HTTPException(400, "A video file is required")
+    destination = browser_proxy_path(file_path)
+    if destination.exists() and destination.stat().st_size:
+        return {"status": "ready", "progress": 100, "error": None}
+    key = str(destination)
+    with proxy_jobs_lock:
+        job = proxy_jobs.get(key)
+        if job and job.get("status") in {"queued", "running"}:
+            return proxy_job_snapshot(job)
+        job = {"status": "queued", "progress": 0, "error": None}
+        proxy_jobs[key] = job
+        threading.Thread(target=create_browser_proxy, args=(file_path, destination, job), daemon=True).start()
+        return proxy_job_snapshot(job)
+
+
+@app.get("/api/browser-proxy/status")
+def browser_proxy_status(path: str) -> dict[str, object]:
+    file_path = checked_path(path, require_file=True)
+    destination = browser_proxy_path(file_path)
+    if destination.exists() and destination.stat().st_size:
+        return {"status": "ready", "progress": 100, "error": None}
+    with proxy_jobs_lock:
+        job = proxy_jobs.get(str(destination))
+        return proxy_job_snapshot(job) if job else {"status": "missing", "progress": 0, "error": None}
+
+
+@app.api_route("/api/browser-proxy/file", methods=["GET", "HEAD"])
+def browser_proxy_file(path: str, request: Request) -> Response:
+    file_path = checked_path(path, require_file=True)
+    destination = browser_proxy_path(file_path)
+    if not destination.exists() or not destination.stat().st_size:
+        raise HTTPException(404, "The browser-compatible video is not ready")
+    return stream_path(destination, request, "video/mp4")
 
 
 @app.get("/api/thumbnail")
@@ -1005,6 +1175,17 @@ def move(request: MoveRequest) -> dict[str, object]:
             "Retry once; if it still fails, choose a writable folder or check its Security permissions.",
         ) from error
     except OSError as error:
+        if error.errno == 28 or getattr(error, "winerror", None) == 112:
+            destination.mkdir(parents=True, exist_ok=True)
+            sources = [Path(value) for value in request.paths]
+            required = required_copy_space(sources, destination) or sum(path_size(path) for path in sources if path.exists())
+            free = shutil.disk_usage(destination).free
+            location = destination.drive or str(destination)
+            raise HTTPException(
+                507,
+                f"Not enough free space on {location}. This move needs about {required / 1024**3:.2f} GB, "
+                f"but only {free / 1024**3:.2f} GB is available.",
+            ) from error
         raise HTTPException(409, f"The move could not be completed. The drive may be disconnected, full, or read-only: {error}") from error
     if records:
         undo_stack.append(records)
@@ -1042,7 +1223,8 @@ def trash(request: PathsRequest) -> dict[str, object]:
 def reveal(request: RevealRequest) -> dict[str, bool]:
     path = checked_path(request.path)
     if sys.platform == "win32":
-        subprocess.Popen(["explorer", "/select,", str(path)])
+        # Explorer requires /select and the target as one argument to reliably highlight it.
+        subprocess.Popen(["explorer.exe", f"/select,{path}"])
     elif sys.platform == "darwin":
         subprocess.Popen(["open", "-R", str(path)])
     else:
