@@ -80,6 +80,11 @@ body.files-collapsed .browser-pane { display: none; }
 .section-collapsed .section-toggle span { transform: rotate(-90deg); }
 .section-collapsed > .section-content { display: none; }
 .nav-list, .destination-list { display: grid; gap: 2px; }
+.nav-location-row { min-width: 0; display: flex; align-items: center; gap: 2px; }
+.nav-location-row .nav-item { min-width: 0; flex: 1; }
+.nav-item.unavailable { opacity: .45; }
+.remove-location { flex: 0 0 26px; height: 26px; border: 0; border-radius: 50%; background: transparent; color: var(--faint); cursor: pointer; }
+.remove-location:hover { background: var(--raised); color: var(--negative); }
 .nav-item, .destination-item, .nav-action { width: 100%; min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 0; border-radius: 7px; padding: 6px 9px; background: transparent; color: var(--muted); text-align: left; cursor: pointer; }
 .nav-item:hover, .destination-item:hover, .nav-action:hover { background: var(--surface); color: var(--text); }
 .nav-item.active { color: var(--text); }
@@ -91,7 +96,11 @@ body.files-collapsed .browser-pane { display: none; }
 
 .browser-pane, .inspector-pane { min-height: 0; background: var(--surface); border-radius: var(--radius-panel); overflow: hidden; }
 .browser-pane { grid-column: 2; display: flex; flex-direction: column; }
-.inspector-pane { grid-column: 3; }
+.inspector-pane { position: relative; grid-column: 3; }
+.inspector-pane:fullscreen { width: 100vw; height: 100vh; border-radius: 0; background: #000; }
+.fullscreen-hint { display: none; }
+.inspector-pane:fullscreen .fullscreen-hint { position: absolute; left: 50%; bottom: 76px; z-index: 8; transform: translateX(-50%); display: flex; align-items: center; gap: 7px; border: 1px solid #333; border-radius: var(--radius-control); padding: 7px 12px; background: rgba(0,0,0,.82); color: var(--muted); white-space: nowrap; pointer-events: none; }
+.inspector-pane:fullscreen .fullscreen-hint kbd { color: #fff; }
 .browser-head { min-height: 72px; display: flex; align-items: center; justify-content: space-between; padding: 15px 16px 12px; }
 .browser-head h2, .inspector-head h2 { margin: 0; font-size: 18px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .progress-pill { margin-left: auto; border-radius: var(--radius-control); padding: 5px 9px; background: var(--raised); color: var(--faint); font-size: 11px; white-space: nowrap; }

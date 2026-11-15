@@ -6,6 +6,8 @@ pixel level. The app binds to `127.0.0.1` only: files never leave your computer.
 ## What it does
 
 - Thumbnail contact sheet for folders, images, video, audio, apps, and files
+- Windows drive browsing with automatic `C:\`, `D:\`, and other mounted-drive discovery
+- Persistent saved folders: choose a folder once and it stays in Places across restarts
 - Large image previews and muted autoplaying video previews on thumbnail hover
 - Image and video zoom from Fit through 800%, with drag-to-pan pixel inspection
 - Autoplay on video selection; click the preview itself to play or pause
@@ -13,6 +15,7 @@ pixel level. The app binds to `127.0.0.1` only: files never leave your computer.
   frame stepping, filmstrip, fullscreen, and picture-in-picture; originals play without transcoding
 - Configurable, renameable one-key moves (up to nine) with native folder pickers and drag-and-drop
 - Auto-advance after sorting and Shift-click range selection
+- Ordered fullscreen review: numbered sort keys advance to the next image/video in the visible queue, and `Ctrl+Z` restores and reselects mistaken moves
 - Keep/Reject queues, ratings, tags, review progress, and resumable folder sessions
 - Side-by-side media comparison with synchronized playback and zoom
 - Exact and visual duplicate finding, batch rename previews, and metadata inspection
@@ -51,6 +54,10 @@ Download and extract this repository, then double-click:
 It installs the app on first launch, starts the private local server, and opens
 the browser automatically. No terminal commands are required. Keep its window
 open while using the app.
+
+Available Windows drives appear under **Places**. Click **Add** or **Open folder**
+to choose another folder; it is saved to the local app configuration until you
+remove it with the × button.
 
 The manual launchers are still available if you prefer them:
 

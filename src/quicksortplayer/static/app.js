@@ -54,10 +54,19 @@ function endpoint(path, params = {}) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
+  const request = () => fetch(path, {
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) }, ...options,
   });
+  let response;
+  try {
+    response = await request();
+  } catch (error) {
+    const method = (options.method || "GET").toUpperCase();
+    if (method !== "GET") throw new Error("The local server was interrupted before the action finished. Nothing was retried; please try again.");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    try { response = await request(); }
+    catch (_) { throw new Error("The local server is restarting or unavailable. Please try again in a moment."); }
+  }
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     try { message = (await response.json()).detail || message; } catch (_) { /* no JSON body */ }
@@ -174,12 +183,50 @@ async function loadInitialData() {
 
 function renderLocations() {
   $("#locations").innerHTML = state.locations.map((location) => `
-    <button class="nav-item ${location.path === state.currentPath ? "active" : ""}"
-      data-path="${escapeHtml(location.path)}" data-short="${escapeHtml(shortLabel(location.name))}">
-      <span>${escapeHtml(location.name)}</span><kbd>G ${escapeHtml(location.hotkey)}</kbd>
-    </button>
+    <div class="nav-location-row">
+      <button class="nav-item ${location.path === state.currentPath ? "active" : ""} ${location.available === false ? "unavailable" : ""}"
+        data-path="${escapeHtml(location.path)}" data-short="${escapeHtml(shortLabel(location.name))}" title="${escapeHtml(location.path)}">
+        <span>${escapeHtml(location.name)}</span>${location.hotkey ? `<kbd>G ${escapeHtml(location.hotkey)}</kbd>` : ""}
+      </button>
+      ${location.source === "saved" ? `<button class="remove-location" data-remove-location="${escapeHtml(location.path)}" title="Remove saved folder" aria-label="Remove ${escapeHtml(location.name)}">×</button>` : ""}
+    </div>
   `).join("");
-  $$("#locations .nav-item").forEach((button) => button.addEventListener("click", () => loadFolder(button.dataset.path)));
+  $$("#locations .nav-item").forEach((button) => button.addEventListener("click", () => {
+    if (button.classList.contains("unavailable")) return showToast("This drive or folder is not currently available");
+    loadFolder(button.dataset.path);
+  }));
+  $$('[data-remove-location]').forEach((button) => button.addEventListener("click", () => removeSavedLocation(button.dataset.removeLocation)));
+}
+
+async function savePickedLocation(path) {
+  const saved = [...(state.config.saved_locations || [])];
+  const normalize = (value) => value.replaceAll("\\", "/").replace(/\/$/, "").toLowerCase();
+  if (!saved.some((location) => normalize(location.path) === normalize(path))) {
+    const name = path.split(/[\\/]/).filter(Boolean).at(-1) || path;
+    saved.push({ name, path });
+  }
+  state.config = await api("/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ destinations: state.config.destinations, labels: state.config.labels, keybindings: state.config.keybindings, saved_locations: saved }),
+  });
+  const data = await api("/api/locations");
+  state.locations = data.locations;
+  renderLocations();
+}
+
+async function removeSavedLocation(path) {
+  const normalize = (value) => value.replaceAll("\\", "/").replace(/\/$/, "").toLowerCase();
+  const saved = (state.config.saved_locations || []).filter((location) => normalize(location.path) !== normalize(path));
+  try {
+    state.config = await api("/api/config", {
+      method: "PUT",
+      body: JSON.stringify({ destinations: state.config.destinations, labels: state.config.labels, keybindings: state.config.keybindings, saved_locations: saved }),
+    });
+    const data = await api("/api/locations");
+    state.locations = data.locations;
+    renderLocations();
+    showToast("Saved folder removed");
+  } catch (error) { showToast(error.message); }
 }
 
 function renderDestinations() {
@@ -824,15 +871,22 @@ async function moveSelected(category) {
   const destination = state.config.destinations?.[category];
   if (!paths.length) return showToast("Select at least one file first");
   if (!destination) return $("#settings").showModal();
-  const nextIndex = state.primary ? state.items.findIndex((item) => item.path === state.primary.path) : -1;
+  const allFiles = state.visibleItems.filter((item) => !item.is_dir);
+  const sameType = state.primary ? allFiles.filter((item) => item.category === state.primary.category) : [];
+  const queue = sameType.length > 1 ? sameType : allFiles;
+  const currentIndex = state.primary ? queue.findIndex((item) => item.path === state.primary.path) : -1;
+  const remaining = new Set(paths);
+  const nextItem = [
+    ...queue.slice(Math.max(0, currentIndex + 1)),
+    ...queue.slice(0, Math.max(0, currentIndex)).reverse(),
+  ].find((item) => !remaining.has(item.path));
   try {
     const result = await api("/api/move", { method: "POST", body: JSON.stringify({ paths, destination }) });
     showToast(`Moved ${result.moved} item${result.moved === 1 ? "" : "s"} · Ctrl+Z to undo`);
     await loadFolder(state.currentPath);
-    const startIndex = Math.min(Math.max(nextIndex, 0), Math.max(state.items.length - 1, 0));
-    const nextItem = state.items.slice(startIndex).find((item) => !item.is_dir)
-      || state.items.slice(0, startIndex).reverse().find((item) => !item.is_dir);
-    if (nextItem) selectItem(nextItem.path);
+    const queued = nextItem && state.items.find((item) => item.path === nextItem.path);
+    const fallback = state.visibleItems.find((item) => !item.is_dir);
+    if (queued || fallback) selectItem((queued || fallback).path);
   } catch (error) { showToast(error.message); }
 }
 
@@ -841,6 +895,8 @@ async function undoMove() {
     const result = await api("/api/undo", { method: "POST", body: "{}" });
     showToast(result.restored ? `Restored ${result.restored} item${result.restored === 1 ? "" : "s"}` : "Nothing to undo");
     await loadFolder(state.currentPath);
+    const restoredPath = (result.paths || []).find((path) => state.items.some((item) => item.path === path));
+    if (restoredPath) selectItem(restoredPath);
   } catch (error) { showToast(error.message); }
 }
 
@@ -1018,7 +1074,11 @@ function addDestination() {
 async function pickFolder() {
   try {
     const result = await api("/api/pick-folder", { method: "POST", body: "{}" });
-    if (result.path) await loadFolder(result.path);
+    if (result.path) {
+      await savePickedLocation(result.path);
+      await loadFolder(result.path);
+      showToast("Folder added to Places");
+    }
   } catch (error) { showToast(error.message); }
 }
 
@@ -1080,7 +1140,7 @@ function openPalette() {
 }
 
 function handleGoChord(key) {
-  const location = state.locations.find((candidate) => candidate.hotkey.toLowerCase() === key.toLowerCase());
+  const location = state.locations.find((candidate) => candidate.hotkey && candidate.hotkey.toLowerCase() === key.toLowerCase());
   state.goChord = false;
   if (location) loadFolder(location.path);
   else showToast("No location uses that key");
@@ -1134,6 +1194,7 @@ function bindEvents() {
     localStorage.setItem(`quick-sort-section:${section.id}`, String(collapsed));
   }));
   $("#open-folder").addEventListener("click", pickFolder);
+  $("#add-location").addEventListener("click", pickFolder);
   $("#open-palette").addEventListener("click", openPalette);
   $("#parent-folder").addEventListener("click", () => loadFolder(state.parentPath));
   $("#back-browser").addEventListener("click", () => document.body.classList.remove("inspecting"));

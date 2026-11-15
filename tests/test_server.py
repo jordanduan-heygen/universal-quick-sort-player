@@ -1,10 +1,14 @@
 from pathlib import Path
+import os
+import sys
+import tempfile
 import zipfile
 
 from fastapi.testclient import TestClient
 from PIL import Image
 from pillow_heif import from_pillow
 import pymupdf
+import pytest
 
 from quicksortplayer import server
 from quicksortplayer.server import app
@@ -83,6 +87,21 @@ def test_batch_rename_contract(tmp_path: Path, monkeypatch):
     assert (tmp_path / "sorted_001_original.txt").read_text() == "hello"
 
 
+def test_move_and_undo_returns_restored_paths(tmp_path: Path):
+    server.undo_stack.clear()
+    source_folder = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source_folder.mkdir()
+    source = source_folder / "clip.mp4"
+    source.write_bytes(b"video")
+    moved = client.post("/api/move", json={"paths": [str(source)], "destination": str(destination)})
+    assert moved.status_code == 200
+    assert (destination / source.name).exists()
+    undone = client.post("/api/undo", json={}).json()
+    assert undone["paths"] == [str(source)]
+    assert source.exists()
+
+
 def test_custom_shortcuts_are_persisted(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(server, "CONFIG_FILE", tmp_path / "config.json")
     response = client.put("/api/config", json={
@@ -93,6 +112,46 @@ def test_custom_shortcuts_are_persisted(tmp_path: Path, monkeypatch):
     assert response.status_code == 200
     assert response.json()["keybindings"]["keep"] == "Q"
     assert server.load_config()["labels"]["photos"] == "Best photos"
+
+
+def test_saved_locations_are_persisted_and_listed(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(server, "CONFIG_FILE", tmp_path / "config.json")
+    saved = tmp_path / "External media"
+    saved.mkdir()
+    response = client.put("/api/config", json={
+        "destinations": {}, "saved_locations": [{"name": "Camera drive", "path": str(saved)}],
+    })
+    assert response.status_code == 200
+    locations = client.get("/api/locations").json()["locations"]
+    assert any(location["name"] == "Camera drive" and location["path"] == str(saved) for location in locations)
+
+
+def test_windows_drive_roots_are_listed(monkeypatch):
+    monkeypatch.setattr(server.sys, "platform", "win32")
+    monkeypatch.setattr(server, "windows_drives", lambda: [Path("C:\\"), Path("D:\\")])
+    locations = server.common_locations({"saved_locations": []})
+    drive_paths = {str(location["path"]) for location in locations if location["source"] == "drive"}
+    assert drive_paths == {"C:\\", "D:\\"}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows runner check")
+def test_real_windows_system_drive_is_exposed():
+    locations = client.get("/api/locations").json()["locations"]
+    assert any(location["source"] == "drive" and str(location["path"]).upper().startswith("C:") for location in locations)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows runner check")
+def test_real_cross_drive_move_when_two_writable_drives_exist(tmp_path: Path):
+    other_drives = [drive for drive in server.windows_drives() if drive.drive.casefold() != tmp_path.drive.casefold()]
+    destination_root = next((drive for drive in other_drives if drive.exists() and os.access(drive, os.W_OK)), None)
+    if destination_root is None:
+        pytest.skip("The Windows runner exposes only one writable drive")
+    source = tmp_path / "cross-drive-test.txt"
+    source.write_text("cross-drive")
+    with tempfile.TemporaryDirectory(dir=destination_root) as temporary:
+        records = server.move_paths([source], Path(temporary))
+        assert len(records) == 1
+        assert records[0].destination.read_text() == "cross-drive"
 
 
 def test_heic_thumbnail_and_browser_render(tmp_path: Path):

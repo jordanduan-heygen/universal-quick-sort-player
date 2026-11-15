@@ -6,6 +6,7 @@ import mimetypes
 import os
 import re
 import shutil
+import string
 import subprocess
 import sys
 import threading
@@ -76,6 +77,7 @@ class ConfigRequest(BaseModel):
     destinations: dict[str, str]
     labels: dict[str, str] | None = None
     keybindings: dict[str, str] | None = None
+    saved_locations: list[dict[str, str]] | None = None
 
 
 class ReviewRequest(BaseModel):
@@ -119,6 +121,7 @@ def load_config() -> dict[str, object]:
         "destinations": default_destinations(),
         "labels": default_labels(),
         "keybindings": default_keybindings(),
+        "saved_locations": [],
         "show_hidden": False,
     }
     try:
@@ -155,6 +158,8 @@ def save_review(records: dict[str, dict[str, object]]) -> None:
 def checked_path(raw: str, *, require_file: bool = False, require_dir: bool = False) -> Path:
     path = Path(raw).expanduser().resolve()
     if not path.exists():
+        if re.match(r"^[A-Za-z]:[\\/]?$", raw.strip()):
+            raise HTTPException(404, f"Drive {raw[:2].upper()} is disconnected, unavailable, or not mounted")
         raise HTTPException(404, f"Path does not exist: {path}")
     if require_file and not path.is_file():
         raise HTTPException(400, "A file path is required")
@@ -224,7 +229,18 @@ def item_payload(path: Path) -> dict[str, object]:
     }
 
 
-def common_locations() -> list[dict[str, str]]:
+def windows_drives() -> list[Path]:
+    if sys.platform != "win32":
+        return []
+    try:
+        import ctypes
+        mask = ctypes.windll.kernel32.GetLogicalDrives()  # type: ignore[attr-defined]
+        return [Path(f"{letter}:\\") for index, letter in enumerate(string.ascii_uppercase) if mask & (1 << index)]
+    except (AttributeError, OSError):
+        return [Path(f"{letter}:\\") for letter in string.ascii_uppercase if Path(f"{letter}:\\").exists()]
+
+
+def common_locations(config: dict[str, object] | None = None) -> list[dict[str, object]]:
     home = Path.home()
     candidates = [
         ("Home", home, "H"),
@@ -240,10 +256,29 @@ def common_locations() -> list[dict[str, str]]:
         program_files = os.environ.get("ProgramFiles")
         if program_files:
             candidates.append(("Applications", Path(program_files), "A"))
-    return [
-        {"name": name, "path": str(path.resolve()), "hotkey": hotkey}
+    locations: list[dict[str, object]] = [
+        {"name": name, "path": str(path.resolve()), "hotkey": hotkey, "source": "system", "available": True}
         for name, path, hotkey in candidates if path.exists()
     ]
+    if sys.platform == "win32":
+        locations.extend({
+            "name": f"{drive.drive or str(drive).rstrip('\\')} Drive", "path": str(drive),
+            "hotkey": "", "source": "drive", "available": drive.exists(),
+        } for drive in windows_drives())
+    seen = {os.path.normcase(os.path.normpath(str(location["path"]))) for location in locations}
+    for saved in (config or {}).get("saved_locations", []):
+        if not isinstance(saved, dict) or not saved.get("path"):
+            continue
+        path = Path(str(saved["path"])).expanduser()
+        key = os.path.normcase(os.path.normpath(str(path)))
+        if key in seen:
+            continue
+        locations.append({
+            "name": str(saved.get("name") or path.name or path), "path": str(path), "hotkey": "",
+            "source": "saved", "available": path.exists(),
+        })
+        seen.add(key)
+    return locations
 
 
 def thumb_cache_path(path: Path, marker: str = "thumb") -> Path:
@@ -501,7 +536,8 @@ def health() -> dict[str, object]:
 
 @app.get("/api/locations")
 def locations() -> dict[str, object]:
-    return {"locations": common_locations(), "config": load_config(), "platform": sys.platform}
+    config = load_config()
+    return {"locations": common_locations(config), "config": config, "platform": sys.platform}
 
 
 @app.get("/api/list")
@@ -517,7 +553,9 @@ def list_directory(path: str = Query(default=str(Path.home())), show_hidden: boo
             except OSError:
                 continue
     except PermissionError as error:
-        raise HTTPException(403, str(error)) from error
+        raise HTTPException(403, f"Windows denied access to this folder. Check its Security permissions: {folder}") from error
+    except OSError as error:
+        raise HTTPException(409, f"This drive could not be read. It may be disconnected or busy: {folder}") from error
     parent = str(folder.parent) if folder.parent != folder else None
     return {"path": str(folder), "parent": parent, "items": items}
 
@@ -699,11 +737,16 @@ def rename_files(request: RenameRequest) -> dict[str, object]:
         planned.append((source, target))
     renamed = []
     review_records = load_review()
-    for source, target in planned:
-        source.rename(target)
-        if str(source) in review_records:
-            review_records[str(target)] = review_records.pop(str(source))
-        renamed.append({"from": str(source), "to": str(target)})
+    try:
+        for source, target in planned:
+            source.rename(target)
+            if str(source) in review_records:
+                review_records[str(target)] = review_records.pop(str(source))
+            renamed.append({"from": str(source), "to": str(target)})
+    except PermissionError as error:
+        raise HTTPException(403, "Windows denied permission to rename this file. Check the drive or folder's Security permissions.") from error
+    except OSError as error:
+        raise HTTPException(409, f"The file could not be renamed: {error}") from error
     save_review(review_records)
     return {"renamed": renamed}
 
@@ -711,7 +754,12 @@ def rename_files(request: RenameRequest) -> dict[str, object]:
 @app.post("/api/move")
 def move(request: MoveRequest) -> dict[str, object]:
     destination = Path(request.destination).expanduser().resolve()
-    records = move_paths([Path(value) for value in request.paths], destination)
+    try:
+        records = move_paths([Path(value) for value in request.paths], destination)
+    except PermissionError as error:
+        raise HTTPException(403, f"Windows denied permission to write to {destination}. Choose a folder you own or update its Security permissions.") from error
+    except OSError as error:
+        raise HTTPException(409, f"The move could not be completed. The drive may be disconnected, full, or read-only: {error}") from error
     if records:
         undo_stack.append(records)
         review_records = load_review()
@@ -728,9 +776,9 @@ def move(request: MoveRequest) -> dict[str, object]:
 @app.post("/api/undo")
 def undo() -> dict[str, object]:
     if not undo_stack:
-        return {"restored": 0, "skipped": 0}
+        return {"restored": 0, "skipped": 0, "paths": []}
     restored, skipped = undo_moves(undo_stack.pop())
-    return {"restored": len(restored), "skipped": len(skipped)}
+    return {"restored": len(restored), "skipped": len(skipped), "paths": [str(record.source) for record in restored]}
 
 
 @app.post("/api/trash")
@@ -782,6 +830,8 @@ def update_config(request: ConfigRequest) -> dict[str, object]:
         config["labels"] = request.labels
     if request.keybindings is not None:
         config["keybindings"] = request.keybindings
+    if request.saved_locations is not None:
+        config["saved_locations"] = request.saved_locations
     save_config(config)
     return config
 

@@ -31,7 +31,10 @@
         <button id="collapse-library" class="pane-collapse" title="Collapse library" aria-label="Collapse library">‹</button>
       </div>
       <section id="places-section">
-        <button class="section-toggle" data-collapse-section="places-section"><h2>Places</h2><span>⌄</span></button>
+        <div class="section-row">
+          <button class="section-toggle" data-collapse-section="places-section"><h2>Places</h2><span>⌄</span></button>
+          <button id="add-location" class="text-button" title="Add and save a folder">Add</button>
+        </div>
         <nav id="locations" class="nav-list section-content"></nav>
       </section>
       <section id="sort-section" class="destination-section">
@@ -157,6 +160,7 @@
           <button id="quick-trash-button" class="danger-button">Recycle Bin <kbd>Delete</kbd></button>
         </div>
       </footer>
+      <div class="fullscreen-hint" aria-hidden="true"><kbd>1–9</kbd> sort <span>·</span> <kbd>↑ ↓</kbd> navigate <span>·</span> <kbd>Space</kbd> play/pause <span>·</span> <kbd>Ctrl Z</kbd> undo <span>·</span> <kbd>F</kbd> exit fullscreen</div>
     </main>
   </div>
 

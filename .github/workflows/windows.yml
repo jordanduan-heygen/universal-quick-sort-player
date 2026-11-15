@@ -25,3 +25,4 @@ jobs:
           if (-not (Test-Path setup.cmd)) { throw "setup.cmd is missing" }
           if (-not (Test-Path run.cmd)) { throw "run.cmd is missing" }
           if (-not (Test-Path run-dev.cmd)) { throw "run-dev.cmd is missing" }
+          if (-not (Test-Path 'Quick Sort Player.cmd')) { throw "One-click Windows launcher is missing" }
