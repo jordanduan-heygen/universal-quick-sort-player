@@ -317,6 +317,7 @@ def proxy_job_snapshot(job: dict[str, object]) -> dict[str, object]:
         "status": job.get("status", "queued"),
         "progress": job.get("progress", 0),
         "error": job.get("error"),
+        "mode": job.get("mode"),
     }
 
 
@@ -339,6 +340,26 @@ def trim_proxy_cache(incoming_bytes: int = 0, keep: Path | None = None) -> None:
         raise OSError(28, "Not enough free space for a browser-compatible playback copy")
 
 
+def h264_can_be_remuxed(probe_output: str) -> bool:
+    """Most 8-bit H.264 needs a new MP4 container, not an expensive re-encode."""
+    video_line = next((line.lower() for line in probe_output.splitlines() if "video:" in line.lower()), "")
+    if not re.search(r"video:\s*h264(?:\s|,|$)", video_line):
+        return False
+    incompatible = (
+        "high 10", "high 4:2:2", "high 4:4:4", "yuv420p10", "yuv422", "yuv444",
+        "gbrp", "12le", "10le",
+    )
+    return not any(marker in video_line for marker in incompatible)
+
+
+def browser_proxy_mode(path: Path) -> str:
+    probe = run_media_command(
+        [get_ffmpeg_exe(), "-hide_banner", "-i", str(path)],
+        path, capture_output=True, text=True, timeout=30,
+    )
+    return "remux" if h264_can_be_remuxed(probe.stderr or "") else "transcode"
+
+
 def create_browser_proxy(path: Path, destination: Path, job: dict[str, object]) -> None:
     PROXY_DIR.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(
@@ -348,10 +369,15 @@ def create_browser_proxy(path: Path, destination: Path, job: dict[str, object]) 
         if job.get("status") == "canceled":
             return
     duration = max(.1, media_duration(path))
+    mode = browser_proxy_mode(path)
+    job["mode"] = mode
+    video_options = ["-c:v", "copy"] if mode == "remux" else [
+        "-c:v", "libx264", "-preset", "superfast", "-crf", "20",
+        "-profile:v", "main", "-pix_fmt", "yuv420p", "-tag:v", "avc1",
+    ]
     command = [
         get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-nostats", "-i", str(path),
-        "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast",
-        "-crf", "20", "-profile:v", "main", "-pix_fmt", "yuv420p", "-tag:v", "avc1",
+        "-map", "0:v:0", "-map", "0:a:0?", *video_options,
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart", "-progress", "pipe:1", "-y", str(temporary),
     ]

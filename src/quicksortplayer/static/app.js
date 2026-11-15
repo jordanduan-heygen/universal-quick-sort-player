@@ -913,7 +913,8 @@ async function recoverUnsupportedVideo(item) {
     });
     while (["queued", "running"].includes(job.status)) {
       if (state.primary?.path !== item.path) return;
-      showToast(`Preparing browser-compatible playback… ${job.progress || 0}%`);
+      const work = job.mode === "remux" ? "Optimizing the video container" : "Converting an unsupported video codec";
+      showToast(`${work}… ${job.progress || 0}%`);
       await wait(1000);
       job = await api(endpoint("/api/browser-proxy/status", { path: item.path }));
     }

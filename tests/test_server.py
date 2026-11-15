@@ -91,6 +91,23 @@ def test_cached_browser_proxy_is_seekable(tmp_path: Path, monkeypatch):
     assert response.headers["content-type"].startswith("video/mp4")
 
 
+@pytest.mark.parametrize("probe", [
+    "Stream #0:0: Video: h264 (High), yuv420p(progressive), 1920x1080",
+    "Stream #0:0: Video: h264 (Main), yuv420p, 1280x720",
+])
+def test_browser_proxy_remuxes_compatible_h264(probe: str):
+    assert server.h264_can_be_remuxed(probe)
+
+
+@pytest.mark.parametrize("probe", [
+    "Stream #0:0: Video: hevc (Main), yuv420p, 3840x2160",
+    "Stream #0:0: Video: h264 (High 10), yuv420p10le, 1920x1080",
+    "Stream #0:0: Video: h264 (High 4:2:2), yuv422p, 1920x1080",
+])
+def test_browser_proxy_transcodes_incompatible_video(probe: str):
+    assert not server.h264_can_be_remuxed(probe)
+
+
 def test_video_repair_explains_missing_moov_atom(tmp_path: Path, monkeypatch):
     video = tmp_path / "incomplete.mp4"
     video.write_bytes(b"\x00\x00\x00\x18ftypisomtruncated")
