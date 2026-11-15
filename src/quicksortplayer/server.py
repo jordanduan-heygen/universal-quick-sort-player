@@ -13,7 +13,9 @@ import sys
 import threading
 import time
 import tarfile
+import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
@@ -492,6 +494,29 @@ def create_video_sprite(path: Path, destination: Path, count: int = 40) -> None:
     columns = 10
     rows = max(1, (count + columns - 1) // columns)
     temporary = temporary_image_path(destination)
+    if count == 10:
+        with tempfile.TemporaryDirectory(dir=THUMB_DIR) as raw_directory:
+            frame_dir = Path(raw_directory)
+            frame_paths = [frame_dir / f"{index:02d}.jpg" for index in range(count)]
+
+            def extract(index: int) -> None:
+                seconds = duration * (index / (count - 1) * .98)
+                extract_video_image(
+                    path, frame_paths[index], seconds,
+                    "scale=160:90:force_original_aspect_ratio=decrease",
+                )
+
+            # Two fast seeks avoid decoding the entire movie without thrashing external drives.
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(extract, range(count)))
+            sprite = Image.new("RGB", (columns * 160, 90), "black")
+            for index, frame_path in enumerate(frame_paths):
+                with Image.open(frame_path) as frame:
+                    frame = frame.convert("RGB")
+                    sprite.paste(frame, (index * 160 + (160 - frame.width) // 2, (90 - frame.height) // 2))
+            sprite.save(temporary, "JPEG", quality=82, optimize=True)
+            temporary.replace(destination)
+            return
     filters = (
         f"fps={count / duration:.8f},scale=160:90:force_original_aspect_ratio=decrease,"
         f"pad=160:90:(ow-iw)/2:(oh-ih)/2:color=black,tile={columns}x{rows}"
@@ -985,7 +1010,7 @@ async def video_sprite(path: str, count: int = Query(40, ge=10, le=100)) -> Resp
     if file_path.suffix.lower() not in VIDEO_EXTENSIONS:
         raise HTTPException(400, "A video file is required")
     count = ((count + 9) // 10) * 10
-    destination = thumb_cache_path(file_path, f"sprite:{count}")
+    destination = thumb_cache_path(file_path, f"sprite:v2:{count}")
     if not destination.exists():
         try:
             await run_in_threadpool(create_video_sprite, file_path, destination, count)

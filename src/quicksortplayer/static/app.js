@@ -997,16 +997,14 @@ async function buildFilmstrip() {
   `).join("");
   $("#filmstrip").classList.remove("hidden");
   $$("#filmstrip [data-film-time]").forEach((button) => button.addEventListener("click", () => { videoPreview.currentTime = Number(button.dataset.filmTime); }));
-  const thumbnailUrl = endpoint("/api/thumbnail", { path: filmstripPath });
-  $$("#filmstrip .frame-sprite").forEach((frame) => {
-    frame.style.backgroundImage = `url("${thumbnailUrl}")`;
-    frame.style.backgroundSize = "cover";
-    frame.style.backgroundPosition = "center";
+  $$("#filmstrip .frame-sprite").forEach((frame, index) => {
+    frame.textContent = formatTime(times[index]);
   });
   try {
     const spriteUrl = await cachedFilmstripSprite(filmstripPath);
     if (state.primary?.path !== filmstripPath) return;
     $$("#filmstrip .frame-sprite").forEach((frame, index) => {
+      frame.textContent = "";
       frame.style.backgroundImage = `url("${spriteUrl}")`;
       frame.style.backgroundSize = "1000% 100%";
       frame.style.backgroundPosition = `${index / 9 * 100}% 0`;
@@ -1014,6 +1012,7 @@ async function buildFilmstrip() {
   } catch (_) {
     if (state.primary?.path !== filmstripPath) return;
     $$("#filmstrip .frame-sprite").forEach((frame, index) => {
+      frame.textContent = "";
       frame.style.backgroundImage = `url("${endpoint("/api/video-frame", { path: filmstripPath, time: times[index] })}")`;
       frame.style.backgroundSize = "cover";
       frame.style.backgroundPosition = "center";
