@@ -869,6 +869,46 @@ async function togglePictureInPicture() {
   } catch (_) { showToast("Picture in picture is not available for this video"); }
 }
 
+async function releaseVideoElement(element) {
+  element.pause();
+  await new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      element.removeEventListener("emptied", finish);
+      resolve();
+    };
+    element.addEventListener("emptied", finish, { once: true });
+    element.removeAttribute("src");
+    element.load();
+    setTimeout(finish, 250);
+  });
+}
+
+async function releaseVideosForMove(paths) {
+  const activeMatches = !videoPreview.classList.contains("hidden") && state.primary && paths.includes(state.primary.path);
+  const hoverMatches = state.hoverPath && paths.includes(state.hoverPath) && !hoverPreviewVideo.classList.contains("hidden");
+  if (!activeMatches && !hoverMatches) return false;
+  if (document.pictureInPictureElement === videoPreview) {
+    try { await document.exitPictureInPicture(); } catch (_) { /* Continue releasing the file handle. */ }
+  }
+  const releases = [];
+  if (activeMatches) releases.push(releaseVideoElement(videoPreview));
+  if (hoverMatches) {
+    clearTimeout(state.hoverTimer);
+    state.hoverTimer = null;
+    state.hoverPath = null;
+    hoverPreview.classList.add("hidden");
+    hoverPreview.setAttribute("aria-hidden", "true");
+    hoverPreviewVideo.classList.add("hidden");
+    hoverPreviewVideo.removeAttribute("poster");
+    releases.push(releaseVideoElement(hoverPreviewVideo));
+  }
+  await Promise.all(releases);
+  return activeMatches;
+}
+
 async function moveSelected(category) {
   const paths = selectedItems().filter((item) => !item.is_dir || category === "files").map((item) => item.path);
   const destination = state.config.destinations?.[category];
@@ -883,6 +923,7 @@ async function moveSelected(category) {
     ...queue.slice(Math.max(0, currentIndex + 1)),
     ...queue.slice(0, Math.max(0, currentIndex)).reverse(),
   ].find((item) => !remaining.has(item.path));
+  const releasedVideo = await releaseVideosForMove(paths);
   try {
     const result = await api("/api/move", { method: "POST", body: JSON.stringify({ paths, destination }) });
     showToast(`Moved ${result.moved} item${result.moved === 1 ? "" : "s"} · Ctrl+Z to undo`);
@@ -890,7 +931,10 @@ async function moveSelected(category) {
     const queued = nextItem && state.items.find((item) => item.path === nextItem.path);
     const fallback = state.visibleItems.find((item) => !item.is_dir);
     if (queued || fallback) selectItem((queued || fallback).path);
-  } catch (error) { showToast(error.message); }
+  } catch (error) {
+    if (releasedVideo && state.primary) showPreview(state.primary);
+    showToast(error.message);
+  }
 }
 
 async function undoMove() {

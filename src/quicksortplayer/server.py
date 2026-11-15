@@ -759,7 +759,11 @@ def move(request: MoveRequest) -> dict[str, object]:
     try:
         records = move_paths([Path(value) for value in request.paths], destination)
     except PermissionError as error:
-        raise HTTPException(403, f"Windows denied permission to write to {destination}. Choose a folder you own or update its Security permissions.") from error
+        raise HTTPException(
+            403,
+            f"Windows blocked the move. A video may still be open, or {destination} may not allow writes. "
+            "Retry once; if it still fails, choose a writable folder or check its Security permissions.",
+        ) from error
     except OSError as error:
         raise HTTPException(409, f"The move could not be completed. The drive may be disconnected, full, or read-only: {error}") from error
     if records:
