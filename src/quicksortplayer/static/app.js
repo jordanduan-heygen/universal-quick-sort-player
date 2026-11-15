@@ -38,6 +38,11 @@ const state = {
   preloadedNextPath: null,
   preloadController: null,
   seekPreviewTimer: null,
+  mediaStates: JSON.parse(localStorage.getItem("quick-sort-media-states") || "{}"),
+  mediaSaveTimer: null,
+  audioAnalysis: null,
+  sprite: null,
+  scrub: JSON.parse(localStorage.getItem("quick-sort-scrub") || '{"normal":5,"fast":30,"fine":1}'),
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -111,6 +116,104 @@ function formatTime(seconds) {
   const minutes = Math.floor((total % 3600) / 60);
   const remainder = total % 60;
   return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}` : `${minutes}:${String(remainder).padStart(2, "0")}`;
+}
+
+function currentMediaState() {
+  if (!state.primary) return { resume: 0, loopIn: null, loopOut: null, loop: false, markers: [] };
+  return state.mediaStates[state.primary.path] || { resume: 0, loopIn: null, loopOut: null, loop: false, markers: [] };
+}
+
+function saveMediaState(changes = {}) {
+  if (!state.primary || !["video", "audio"].includes(state.primary.preview_type)) return;
+  const record = { ...currentMediaState(), ...changes, updated: Date.now() };
+  state.mediaStates[state.primary.path] = record;
+  const entries = Object.entries(state.mediaStates).sort((a, b) => (b[1].updated || 0) - (a[1].updated || 0)).slice(0, 500);
+  state.mediaStates = Object.fromEntries(entries);
+  clearTimeout(state.mediaSaveTimer);
+  state.mediaSaveTimer = setTimeout(() => localStorage.setItem("quick-sort-media-states", JSON.stringify(state.mediaStates)), 150);
+  if (Object.keys(changes).some((key) => key !== "resume")) renderTimelineOverlays();
+}
+
+function renderTimelineOverlays() {
+  const overlays = $("#timeline-overlays");
+  const duration = videoPreview.duration;
+  if (!Number.isFinite(duration) || !duration) { overlays.innerHTML = ""; return; }
+  const record = currentMediaState();
+  const parts = [];
+  (state.audioAnalysis?.silence || []).forEach(([start, end]) => parts.push(`<span class="silence-range" style="left:${start / duration * 100}%;width:${Math.max(0, end - start) / duration * 100}%" title="Silent ${formatTime(start)}–${formatTime(end)}"></span>`));
+  if (Number.isFinite(record.loopIn) && Number.isFinite(record.loopOut) && record.loopOut > record.loopIn) {
+    parts.push(`<span class="loop-range" style="left:${record.loopIn / duration * 100}%;width:${(record.loopOut - record.loopIn) / duration * 100}%"></span>`);
+  }
+  (record.markers || []).forEach((marker, index) => parts.push(`<button class="timeline-marker" data-marker-index="${index}" style="left:${marker.time / duration * 100}%" title="${escapeHtml(marker.label || `Bookmark ${index + 1}`)} · ${formatTime(marker.time)}"></button>`));
+  overlays.innerHTML = parts.join("");
+  $$('[data-marker-index]').forEach((button) => button.addEventListener("click", () => {
+    videoPreview.currentTime = record.markers[Number(button.dataset.markerIndex)].time;
+  }));
+  $("#loop-button").classList.toggle("active", Boolean(record.loop));
+}
+
+function setLoopPoint(kind) {
+  if (!Number.isFinite(videoPreview.duration)) return;
+  const record = currentMediaState();
+  const value = videoPreview.currentTime;
+  if (kind === "in") saveMediaState({ loopIn: value, loopOut: Number.isFinite(record.loopOut) && record.loopOut > value ? record.loopOut : null, loop: false });
+  else saveMediaState({ loopOut: value, loopIn: Number.isFinite(record.loopIn) && record.loopIn < value ? record.loopIn : null, loop: false });
+  showToast(`${kind === "in" ? "In" : "Out"} point set at ${formatTime(value)}`);
+}
+
+function toggleLoopRange() {
+  const record = currentMediaState();
+  if (!Number.isFinite(record.loopIn) || !Number.isFinite(record.loopOut) || record.loopOut <= record.loopIn) {
+    showToast("Set an In point and an Out point first"); return;
+  }
+  saveMediaState({ loop: !record.loop });
+}
+
+function addBookmark() {
+  if (!Number.isFinite(videoPreview.duration)) return;
+  const record = currentMediaState();
+  const markers = [...(record.markers || []), { time: videoPreview.currentTime, label: `Bookmark ${(record.markers || []).length + 1}` }].sort((a, b) => a.time - b.time);
+  saveMediaState({ markers });
+  showToast(`Bookmark added at ${formatTime(videoPreview.currentTime)}`);
+}
+
+function drawWaveform() {
+  const canvas = $("#waveform");
+  const rect = canvas.getBoundingClientRect();
+  const scale = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.round(rect.width * scale));
+  canvas.height = Math.max(1, Math.round(rect.height * scale));
+  const context = canvas.getContext("2d");
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  const samples = state.audioAnalysis?.waveform || [];
+  if (!samples.length) return;
+  context.fillStyle = "rgba(76, 179, 240, .78)";
+  const middle = canvas.height / 2;
+  samples.forEach((value, index) => {
+    const x = index / samples.length * canvas.width;
+    const height = Math.max(1, value * canvas.height * .9);
+    context.fillRect(x, middle - height / 2, Math.max(1, canvas.width / samples.length), height);
+  });
+}
+
+async function loadAudioAnalysis(path) {
+  state.audioAnalysis = null;
+  drawWaveform();
+  try {
+    const analysis = await api(endpoint("/api/audio-analysis", { path }));
+    if (state.primary?.path !== path) return;
+    state.audioAnalysis = analysis;
+    drawWaveform(); renderTimelineOverlays();
+  } catch (_) { /* Some media containers do not contain an audio stream. */ }
+}
+
+function prepareVideoSprite(path) {
+  state.sprite = null;
+  if (!Number.isFinite(videoPreview.duration) || videoPreview.duration < 60) return;
+  const image = new Image();
+  const url = endpoint("/api/video-sprite", { path, count: 40 });
+  image.onload = () => { if (state.primary?.path === path) state.sprite = { url, count: 40, columns: 10, rows: 4 }; };
+  image.src = url;
 }
 
 function shortLabel(name) {
@@ -321,6 +424,9 @@ function renderSettings() {
     </div>
   `).join("");
   $$('[data-browse-destination]').forEach((button) => button.addEventListener("click", () => chooseDestination(button.dataset.browseDestination, false)));
+  $("#scrub-normal").value = state.scrub.normal ?? 5;
+  $("#scrub-fast").value = state.scrub.fast ?? 30;
+  $("#scrub-fine").value = state.scrub.fine ?? 1;
 }
 
 function bindDestinationDrops() {
@@ -720,6 +826,10 @@ function resetPreviewElements() {
   videoPreview.pause();
   videoPreview.removeAttribute("src");
   videoPreview.load();
+  state.audioAnalysis = null;
+  state.sprite = null;
+  drawWaveform();
+  $("#timeline-overlays").innerHTML = "";
   state.zoomMode = "fit";
   state.zoomScale = 1;
   state.pan = { x: 0, y: 0 };
@@ -760,6 +870,7 @@ function showPreview(item) {
     $("#transport").classList.remove("hidden");
     $("#zoom-controls").classList.toggle("hidden", item.preview_type === "audio");
     videoPreview.play().catch(() => { /* Browser may require one click before audio playback. */ });
+    loadAudioAnalysis(item.path);
   } else if (item.preview_type === "pdf") {
     $("#document-preview").src = endpoint("/api/media", { path: item.path });
     $("#document-preview").classList.remove("hidden");
@@ -883,9 +994,22 @@ function positionSeekPreview(seconds, clientX) {
   preview.classList.remove("hidden");
   clearTimeout(state.seekPreviewTimer);
   const path = state.primary.path;
+  const image = $("#seek-preview-image");
+  const visual = $("#seek-preview-visual");
+  if (state.sprite && state.primary.preview_type === "video") {
+    const index = Math.min(state.sprite.count - 1, Math.round(seconds / videoPreview.duration * (state.sprite.count - 1)));
+    const column = index % state.sprite.columns;
+    const row = Math.floor(index / state.sprite.columns);
+    visual.style.backgroundImage = `url("${state.sprite.url}")`;
+    visual.style.backgroundSize = `${state.sprite.columns * 100}% ${state.sprite.rows * 100}%`;
+    visual.style.backgroundPosition = `${column / (state.sprite.columns - 1) * 100}% ${row / (state.sprite.rows - 1) * 100}%`;
+    image.classList.add("hidden");
+    return;
+  }
+  visual.style.backgroundImage = "";
+  image.classList.remove("hidden");
   state.seekPreviewTimer = setTimeout(() => {
     if (state.primary?.path !== path) return;
-    const image = $("#seek-preview-image");
     image.dataset.fallback = "";
     image.src = endpoint("/api/video-frame", { path, time: Math.round(seconds * 2) / 2 });
   }, 90);
@@ -903,7 +1027,7 @@ function scrubWithWheel(event) {
   event.preventDefault();
   const direction = Math.sign(event.deltaY || event.deltaX);
   if (!direction) return;
-  const step = event.altKey ? 1 / 30 : event.shiftKey ? 30 : 5;
+  const step = event.altKey ? Math.max(1, Number(state.scrub.fine) || 1) / 30 : event.shiftKey ? Math.max(1, Number(state.scrub.fast) || 30) : Math.max(.1, Number(state.scrub.normal) || 5);
   const target = Math.max(0, Math.min(videoPreview.duration, videoPreview.currentTime + direction * step));
   if (event.shiftKey && typeof videoPreview.fastSeek === "function") videoPreview.fastSeek(target);
   else videoPreview.currentTime = target;
@@ -1457,6 +1581,12 @@ function handleKeydown(event) {
     return;
   }
   if (event.altKey && /^[1-5]$/.test(key)) { event.preventDefault(); updateReview({ rating: Number(key) }); return; }
+  if (!videoPreview.classList.contains("hidden") && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    if (key === "b") { event.preventDefault(); addBookmark(); return; }
+    if (key === "i") { event.preventDefault(); setLoopPoint("in"); return; }
+    if (key === "o") { event.preventDefault(); setLoopPoint("out"); return; }
+    if (key === "l" && event.shiftKey) { event.preventDefault(); toggleLoopRange(); return; }
+  }
   const shortcut = shortcutFromEvent(event);
   const actions = [
     ["previous", () => selectRelative(-1)], ["next", () => selectRelative(1)], ["open_folder", () => { if (state.primary?.is_dir) loadFolder(state.primary.path); }],
@@ -1537,6 +1667,11 @@ function bindEvents() {
   $("#frame-back").addEventListener("click", () => stepFrame(-1));
   $("#forward-10").addEventListener("click", () => jumpVideo(10));
   $("#frame-forward").addEventListener("click", () => stepFrame(1));
+  $("#mark-button").addEventListener("click", addBookmark);
+  $("#in-button").addEventListener("click", () => setLoopPoint("in"));
+  $("#out-button").addEventListener("click", () => setLoopPoint("out"));
+  $("#loop-button").addEventListener("click", toggleLoopRange);
+  $("#clear-range-button").addEventListener("click", () => saveMediaState({ loopIn: null, loopOut: null, loop: false }));
   $("#mute-button").addEventListener("click", toggleMute);
   $("#volume").addEventListener("input", (event) => {
     videoPreview.volume = Number(event.target.value);
@@ -1604,6 +1739,12 @@ function bindEvents() {
     event.preventDefault();
     const destinations = Object.fromEntries($$("[data-destination]").map((input) => [input.dataset.destination, input.value]));
     const labels = Object.fromEntries($$("[data-destination-label]").map((input) => [input.dataset.destinationLabel, input.value.trim() || input.dataset.destinationLabel]));
+    state.scrub = {
+      normal: Math.max(.1, Number($("#scrub-normal").value) || 5),
+      fast: Math.max(1, Number($("#scrub-fast").value) || 30),
+      fine: Math.max(1, Number($("#scrub-fine").value) || 1),
+    };
+    localStorage.setItem("quick-sort-scrub", JSON.stringify(state.scrub));
     try {
       state.config = await api("/api/config", { method: "PUT", body: JSON.stringify({ destinations, labels }) });
       renderDestinations();
@@ -1637,14 +1778,22 @@ function bindEvents() {
     const dimensions = mediaDimensions(videoPreview);
     if (dimensions.width) $("#selected-meta").textContent += ` · ${dimensions.width} × ${dimensions.height}px`;
     applyZoom();
+    const record = currentMediaState();
+    if (Number.isFinite(record.resume) && record.resume > 0 && record.resume < videoPreview.duration - 2) videoPreview.currentTime = record.resume;
     buildFilmstrip();
+    prepareVideoSprite(state.primary.path);
+    renderTimelineOverlays();
     updateSeekVisuals();
   });
   videoPreview.addEventListener("timeupdate", () => {
+    const record = currentMediaState();
+    if (record.loop && Number.isFinite(record.loopIn) && Number.isFinite(record.loopOut) && videoPreview.currentTime >= record.loopOut) videoPreview.currentTime = record.loopIn;
     $("#seek").value = Number.isFinite(videoPreview.duration) && videoPreview.duration ? Math.round(videoPreview.currentTime / videoPreview.duration * 1000) : 0;
     $("#time-value").textContent = `${formatTime(videoPreview.currentTime)} / ${formatTime(videoPreview.duration)}`;
     updateSeekVisuals();
+    saveMediaState({ resume: videoPreview.currentTime });
   });
+  videoPreview.addEventListener("ended", () => saveMediaState({ resume: 0 }));
   videoPreview.addEventListener("progress", updateSeekVisuals);
   videoPreview.addEventListener("durationchange", updateSeekVisuals);
   videoPreview.addEventListener("play", () => { $("#play-button").textContent = "Pause"; });

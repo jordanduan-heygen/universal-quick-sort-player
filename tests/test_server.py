@@ -211,3 +211,29 @@ def test_pdf_text_and_archive_previews(tmp_path: Path):
         bundle.writestr("inside/readme.txt", "hello")
     entries = client.get("/api/archive-preview", params={"path": str(archive)}).json()["entries"]
     assert "inside/readme.txt" in entries
+
+
+def test_cached_audio_analysis_endpoint(tmp_path: Path, monkeypatch):
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"media")
+    monkeypatch.setattr(server, "THUMB_DIR", tmp_path / "cache")
+    monkeypatch.setattr(server, "analyze_audio", lambda _path: {
+        "duration": 12.5, "waveform": [0.1, 0.8, 0.2], "silence": [[2.0, 3.0]],
+    })
+    response = client.get("/api/audio-analysis", params={"path": str(media)})
+    assert response.status_code == 200
+    assert response.json()["silence"] == [[2.0, 3.0]]
+    assert len(list((tmp_path / "cache").glob("*.json"))) == 1
+
+
+def test_cached_video_sprite_endpoint(tmp_path: Path, monkeypatch):
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"media")
+    monkeypatch.setattr(server, "THUMB_DIR", tmp_path / "cache")
+    monkeypatch.setattr(server, "create_video_sprite", lambda _path, destination, _count: (
+        destination.parent.mkdir(parents=True, exist_ok=True), destination.write_bytes(b"jpeg")
+    ))
+    response = client.get("/api/video-sprite", params={"path": str(media), "count": 40})
+    assert response.status_code == 200
+    assert response.headers["x-sprite-columns"] == "10"
+    assert response.headers["x-sprite-count"] == "40"

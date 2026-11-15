@@ -13,6 +13,9 @@ pixel level. The app binds to `127.0.0.1` only: files never leave your computer.
 - Autoplay on video selection; click the preview itself to play or pause
 - Full video controls: seek, volume, mute, ±10/30 second jumps, 0.5×–2× speed,
   frame stepping, filmstrip, fullscreen, and picture-in-picture; originals play without transcoding
+- High-speed wheel scrubbing with configurable normal, fast, and frame-fine steps
+- Per-video resume positions, timeline bookmarks, and In/Out range looping
+- Cached audio waveforms with detected silence regions, plus sprite-sheet hover previews for long videos
 - Configurable, renameable one-key moves (up to nine) with native folder pickers and drag-and-drop
 - Auto-advance after sorting and Shift-click range selection
 - Ordered fullscreen review: numbered sort keys advance to the next image/video in the visible queue, and `Ctrl+Z` restores and reselects mistaken moves

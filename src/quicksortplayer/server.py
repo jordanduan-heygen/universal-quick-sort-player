@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import array
 import json
 import mimetypes
 import os
@@ -368,6 +369,62 @@ def create_video_frame(path: Path, destination: Path, seconds: float) -> None:
     temporary.replace(destination)
 
 
+def media_duration(path: Path) -> float:
+    process = subprocess.run(
+        [get_ffmpeg_exe(), "-hide_banner", "-i", str(path)], capture_output=True, text=True, timeout=30,
+    )
+    match = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", process.stderr)
+    if not match:
+        raise ValueError("Media duration is unavailable")
+    return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+
+
+def create_video_sprite(path: Path, destination: Path, count: int = 40) -> None:
+    THUMB_DIR.mkdir(parents=True, exist_ok=True)
+    duration = max(.1, media_duration(path))
+    columns = 10
+    rows = max(1, (count + columns - 1) // columns)
+    temporary = destination.with_suffix(".tmp.jpg")
+    filters = (
+        f"fps={count / duration:.8f},scale=160:90:force_original_aspect_ratio=decrease,"
+        f"pad=160:90:(ow-iw)/2:(oh-ih)/2:color=black,tile={columns}x{rows}"
+    )
+    subprocess.run([
+        get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", str(path),
+        "-vf", filters, "-frames:v", "1", "-q:v", "5", "-y", str(temporary),
+    ], check=True, timeout=120)
+    temporary.replace(destination)
+
+
+def analyze_audio(path: Path) -> dict[str, object]:
+    duration = media_duration(path)
+    pcm = subprocess.run([
+        get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", str(path),
+        "-vn", "-ac", "1", "-ar", "100", "-f", "s16le", "-",
+    ], check=True, capture_output=True, timeout=120).stdout
+    values = array.array("h")
+    values.frombytes(pcm[:len(pcm) - len(pcm) % 2])
+    if sys.byteorder != "little":
+        values.byteswap()
+    bins = 320
+    waveform: list[float] = []
+    for index in range(bins):
+        start = index * len(values) // bins
+        end = max(start + 1, (index + 1) * len(values) // bins)
+        peak = max((abs(value) for value in values[start:end]), default=0)
+        waveform.append(round(min(1, peak / 32768), 4))
+    silence_process = subprocess.run([
+        get_ffmpeg_exe(), "-hide_banner", "-i", str(path), "-af", "silencedetect=noise=-35dB:d=0.7",
+        "-f", "null", "-",
+    ], capture_output=True, text=True, timeout=120)
+    starts = [float(value) for value in re.findall(r"silence_start:\s*([\d.]+)", silence_process.stderr)]
+    ends = [float(value) for value in re.findall(r"silence_end:\s*([\d.]+)", silence_process.stderr)]
+    if len(starts) > len(ends):
+        ends.append(duration)
+    silence = [[round(start, 3), round(min(duration, end), 3)] for start, end in zip(starts, ends) if end > start]
+    return {"duration": duration, "waveform": waveform, "silence": silence}
+
+
 def hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -685,6 +742,39 @@ async def video_frame(path: str, time: float = 0) -> Response:
         except Exception:
             return Response(status_code=204)
     return FileResponse(destination, media_type="image/jpeg")
+
+
+@app.get("/api/video-sprite")
+async def video_sprite(path: str, count: int = Query(40, ge=10, le=100)) -> Response:
+    file_path = checked_path(path, require_file=True)
+    if file_path.suffix.lower() not in VIDEO_EXTENSIONS:
+        raise HTTPException(400, "A video file is required")
+    count = ((count + 9) // 10) * 10
+    destination = thumb_cache_path(file_path, f"sprite:{count}")
+    if not destination.exists():
+        try:
+            await run_in_threadpool(create_video_sprite, file_path, destination, count)
+        except Exception as error:
+            raise HTTPException(415, "A preview sprite could not be generated for this video") from error
+    return FileResponse(destination, media_type="image/jpeg", headers={"X-Sprite-Columns": "10", "X-Sprite-Count": str(count)})
+
+
+@app.get("/api/audio-analysis")
+async def audio_analysis(path: str) -> dict[str, object]:
+    file_path = checked_path(path, require_file=True)
+    if file_path.suffix.lower() not in VIDEO_EXTENSIONS | AUDIO_EXTENSIONS:
+        raise HTTPException(400, "An audio or video file is required")
+    destination = thumb_cache_path(file_path, "audio-analysis").with_suffix(".json")
+    if not destination.exists():
+        try:
+            result = await run_in_threadpool(analyze_audio, file_path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_suffix(".tmp.json")
+            temporary.write_text(json.dumps(result), encoding="utf-8")
+            temporary.replace(destination)
+        except Exception as error:
+            raise HTTPException(415, "Audio analysis is unavailable for this file") from error
+    return json.loads(destination.read_text(encoding="utf-8"))
 
 
 @app.get("/api/review")
