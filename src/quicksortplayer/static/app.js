@@ -33,6 +33,8 @@ const state = {
   duplicateJob: null,
   duplicateTimer: null,
   duplicateNotified: new Set(),
+  duplicateCompareGroup: null,
+  duplicateCompareZoom: 1,
   locationTree: new Map(),
   expandedLocations: new Set(),
   preloadedNextPath: null,
@@ -1277,32 +1279,150 @@ function toggleComparePlayback() {
   $("#compare-play").textContent = shouldPlay ? "Pause both" : "Play both";
 }
 
+function duplicateMetricClass(value, values) {
+  const numeric = values.filter((candidate) => Number.isFinite(candidate));
+  if (!Number.isFinite(value) || numeric.length < 2 || Math.max(...numeric) === Math.min(...numeric)) return "";
+  if (value === Math.max(...numeric)) return "metric-best";
+  if (value === Math.min(...numeric)) return "metric-worst";
+  return "";
+}
+
+function duplicateResolution(metadata) {
+  return Number(metadata?.width || 0) * Number(metadata?.height || 0);
+}
+
+function renderDuplicateComparisonMetadata(groupIndex, metadata) {
+  const group = state.duplicateGroups[groupIndex];
+  if (!group || state.duplicateCompareGroup !== groupIndex) return;
+  const resolutions = metadata.map(duplicateResolution);
+  const bitrates = metadata.map((item) => Number.parseFloat(item?.bitrate || "0"));
+  const sizes = group.files.map((file) => Number(file.size));
+  const dates = group.files.map((file) => Number(file.modified));
+  const ranked = group.files.map((file, index) => ({ index, score: [resolutions[index], bitrates[index], sizes[index], dates[index]] }))
+    .sort((a, b) => {
+      for (let position = 0; position < a.score.length; position += 1) {
+        if (a.score[position] !== b.score[position]) return b.score[position] - a.score[position];
+      }
+      return 0;
+    });
+  const recommendedIndex = ranked[0]?.index ?? 0;
+  group.keeper = group.files[recommendedIndex].path;
+  group.files.forEach((file, index) => {
+    const item = metadata[index] || {};
+    const resolution = resolutions[index];
+    const values = [
+      ["Resolution", item.width && item.height ? `${item.width} × ${item.height}` : "Unknown", duplicateMetricClass(resolution, resolutions)],
+      ["File size", formatBytes(file.size), duplicateMetricClass(sizes[index], sizes)],
+      ["Bitrate", item.bitrate ? `${Math.round(bitrates[index]).toLocaleString()} kbps` : "—", duplicateMetricClass(bitrates[index], bitrates)],
+      ["Modified", new Date(file.modified * 1000).toLocaleString(), duplicateMetricClass(dates[index], dates)],
+      ["Codec", [item.video_codec, item.audio_codec].filter(Boolean).join(" / ") || item.kind || "—", ""],
+      ["Location", file.path, ""],
+    ];
+    const card = $(`[data-duplicate-compare-card="${index}"]`);
+    if (!card) return;
+    card.querySelector(".duplicate-metrics").innerHTML = values.map(([label, value, className]) => `<dt>${label}</dt><dd class="${className}">${escapeHtml(value)}</dd>`).join("");
+    card.querySelector(".recommended-badge").classList.toggle("hidden", index !== recommendedIndex);
+  });
+  chooseDuplicateKeeper(groupIndex, recommendedIndex, { quiet: true, selectOthers: group.kind === "exact" });
+}
+
+async function openDuplicateComparison(groupIndex, focusIndex = 0) {
+  const group = state.duplicateGroups[groupIndex];
+  if (!group) return;
+  state.duplicateCompareGroup = groupIndex;
+  state.duplicateCompareZoom = 1;
+  const label = { exact: "Exact copies", similar_image: "Visually similar images", similar_video: "Visually similar videos" }[group.kind] || "Possible duplicates";
+  $("#duplicate-compare-summary").textContent = `${label} · ${group.confidence}% match · compare quality before choosing a keeper`;
+  $("#duplicate-compare-grid").innerHTML = group.files.map((file, index) => {
+    const media = file.category === "videos"
+      ? `<video src="${endpoint("/api/media", { path: file.path })}" muted loop playsinline preload="metadata"></video>`
+      : `<img src="${endpoint(file.browser_native === false ? "/api/rendered-image" : "/api/media", { path: file.path })}" alt="${escapeHtml(file.name)}">`;
+    return `<article class="duplicate-compare-card ${file.path === group.keeper ? "recommended" : ""}" data-duplicate-compare-card="${index}">
+      <div class="duplicate-compare-media">${media}</div>
+      <div class="duplicate-compare-info">
+        <div class="duplicate-compare-title"><strong>${escapeHtml(file.name)}</strong><span class="recommended-badge ${file.path === group.keeper ? "" : "hidden"}">Recommended keeper</span></div>
+        <dl class="duplicate-metrics"><dt>Loading</dt><dd>Reading metadata…</dd></dl>
+      </div>
+      <div class="duplicate-compare-actions"><button class="keep-choice" data-keep-duplicate="${index}">Keep this one</button><button class="remove-choice" data-remove-duplicate="${index}">Mark for Recycle Bin</button></div>
+    </article>`;
+  }).join("");
+  $("#duplicate-compare-seek").value = 0;
+  $("#duplicate-compare-seek").disabled = group.files.every((file) => file.category !== "videos");
+  $("#duplicate-compare-play").classList.toggle("hidden", group.files.every((file) => file.category !== "videos"));
+  $$('[data-keep-duplicate]').forEach((button) => button.addEventListener("click", () => chooseDuplicateKeeper(groupIndex, Number(button.dataset.keepDuplicate))));
+  $$('[data-remove-duplicate]').forEach((button) => button.addEventListener("click", () => toggleDuplicateRemoval(groupIndex, Number(button.dataset.removeDuplicate))));
+  const videos = $$("#duplicate-compare-grid video");
+  videos[0]?.addEventListener("timeupdate", () => {
+    if (Number.isFinite(videos[0].duration) && videos[0].duration) $("#duplicate-compare-seek").value = Math.round(videos[0].currentTime / videos[0].duration * 1000);
+  });
+  if (!$("#duplicate-compare").open) $("#duplicate-compare").showModal();
+  requestAnimationFrame(() => $(`[data-duplicate-compare-card="${focusIndex}"]`)?.scrollIntoView({ inline: "center", block: "nearest" }));
+  const metadata = await Promise.all(group.files.map((file) => api(endpoint("/api/metadata", { path: file.path })).catch(() => ({}))));
+  renderDuplicateComparisonMetadata(groupIndex, metadata);
+}
+
+function chooseDuplicateKeeper(groupIndex, keeperIndex, { quiet = false, selectOthers = true } = {}) {
+  const group = state.duplicateGroups[groupIndex];
+  if (!group) return;
+  group.keeper = group.files[keeperIndex].path;
+  group.files.forEach((file, index) => {
+    const checkbox = $(`[data-duplicate-check="${groupIndex}:${index}"]`);
+    if (checkbox && selectOthers) checkbox.checked = index !== keeperIndex;
+    const card = $(`[data-duplicate-compare-card="${index}"]`);
+    card?.classList.toggle("recommended", index === keeperIndex);
+    card?.querySelector(".recommended-badge")?.classList.toggle("hidden", index !== keeperIndex);
+    $(`[data-duplicate-keeper-badge="${groupIndex}:${index}"]`)?.classList.toggle("hidden", index !== keeperIndex);
+    card?.querySelector(".remove-choice")?.classList.toggle("active", Boolean(checkbox?.checked));
+  });
+  updateDuplicateSelection();
+  if (!quiet) showToast(`${group.files[keeperIndex].name} will be kept`);
+}
+
+function toggleDuplicateRemoval(groupIndex, fileIndex) {
+  const checkbox = $(`[data-duplicate-check="${groupIndex}:${fileIndex}"]`);
+  if (!checkbox) return;
+  checkbox.checked = !checkbox.checked;
+  $(`[data-duplicate-compare-card="${fileIndex}"] .remove-choice`)?.classList.toggle("active", checkbox.checked);
+  updateDuplicateSelection();
+}
+
+function adjustDuplicateCompareZoom(factor) {
+  state.duplicateCompareZoom = Math.max(.5, Math.min(8, state.duplicateCompareZoom * factor));
+  $$("#duplicate-compare-grid img, #duplicate-compare-grid video").forEach((media) => { media.style.transform = `scale(${state.duplicateCompareZoom})`; });
+}
+
+function toggleDuplicateComparePlayback() {
+  const videos = $$("#duplicate-compare-grid video");
+  const shouldPlay = videos.some((video) => video.paused);
+  videos.forEach((video) => { if (shouldPlay) video.play().catch(() => {}); else video.pause(); });
+  $("#duplicate-compare-play").textContent = shouldPlay ? "Pause all" : "Play all";
+}
+
 function renderDuplicateResult(result) {
   state.duplicateGroups = result.groups || [];
   const labels = { exact: "Exact copies", similar_image: "Similar images", similar_video: "Similar videos" };
   $("#duplicates-summary").textContent = `${state.duplicateGroups.length} group${state.duplicateGroups.length === 1 ? "" : "s"} · ${result.scanned} files scanned · up to ${formatBytes(result.reclaimable)} reclaimable`;
   $("#duplicates-results").innerHTML = state.duplicateGroups.length ? state.duplicateGroups.map((group, groupIndex) => `
       <section class="duplicate-group">
-        <div class="duplicate-group-head"><strong>${labels[group.kind] || "Possible duplicates"}</strong><span>${group.confidence}% match · ${formatBytes(group.reclaimable)} reclaimable</span></div>
+        <div class="duplicate-group-head"><div><strong>${labels[group.kind] || "Possible duplicates"}</strong><button class="duplicate-compare-button" data-compare-duplicate-group="${groupIndex}">Compare side by side</button></div><span>${group.confidence}% match · ${formatBytes(group.reclaimable)} reclaimable</span></div>
         ${group.files.map((file, fileIndex) => {
           const keeper = file.path === group.keeper;
           const thumbnail = ["images", "videos"].includes(file.category) ? endpoint("/api/thumbnail", { path: file.path }) : "";
           return `<label class="duplicate-file">
             <input type="checkbox" data-duplicate-check="${groupIndex}:${fileIndex}" ${!keeper && group.kind === "exact" ? "checked" : ""} aria-label="Remove ${escapeHtml(file.name)}">
             <button type="button" class="duplicate-thumb" data-duplicate-preview="${groupIndex}:${fileIndex}" title="Preview ${escapeHtml(file.name)}">${thumbnail ? `<img src="${thumbnail}" alt="">` : `<span>${escapeHtml(file.name.split(".").at(-1).toUpperCase())}</span>`}</button>
-            <span class="duplicate-copy"><strong>${escapeHtml(file.name)}</strong><span>${new Date(file.modified * 1000).toLocaleString()}</span>${keeper ? '<span class="keeper-badge">Suggested keeper</span>' : ""}</span>
+            <span class="duplicate-copy"><strong>${escapeHtml(file.name)}</strong><span>${new Date(file.modified * 1000).toLocaleString()}</span><span class="keeper-badge ${keeper ? "" : "hidden"}" data-duplicate-keeper-badge="${groupIndex}:${fileIndex}">Suggested keeper</span></span>
             <span class="duplicate-size">${formatBytes(file.size)}</span>
           </label>`;
         }).join("")}
       </section>
   `).join("") : '<div class="empty-list">No duplicate images or videos found in this folder.</div>';
   $$('[data-duplicate-check]').forEach((checkbox) => checkbox.addEventListener("change", updateDuplicateSelection));
+  $$('[data-compare-duplicate-group]').forEach((button) => button.addEventListener("click", () => openDuplicateComparison(Number(button.dataset.compareDuplicateGroup))));
   $$('[data-duplicate-preview]').forEach((button) => button.addEventListener("click", (event) => {
     event.preventDefault();
     const [groupIndex, fileIndex] = button.dataset.duplicatePreview.split(":").map(Number);
-    const file = state.duplicateGroups[groupIndex].files[fileIndex];
-    $("#duplicates").close();
-    selectItem(file.path);
+    openDuplicateComparison(groupIndex, fileIndex);
   }));
   updateDuplicateSelection();
 }
@@ -1572,8 +1692,12 @@ function handleKeydown(event) {
     handleGoChord(event.key);
     return;
   }
-  if (isTyping(event) || $("dialog[open]")) return;
   const key = event.key.toLowerCase();
+  const focusedSeek = event.target === $("#seek");
+  if ((isTyping(event) && !focusedSeek) || $("dialog[open]")) return;
+  // A mouse click leaves the range input focused. Keep its native precision keys,
+  // but let sorting and player shortcuts continue to work without an extra click.
+  if (focusedSeek && ["arrowleft", "arrowright", "home", "end", "pageup", "pagedown"].includes(key)) return;
   if (key === "g") {
     state.goChord = true;
     showToast("Go to: D Downloads · P Pictures · V Videos · H Home · B Desktop");
@@ -1639,6 +1763,25 @@ function bindEvents() {
   $("#duplicates-button").addEventListener("click", openDuplicates);
   $("#duplicates-rescan").addEventListener("click", () => startDuplicateScan($("#duplicates").dataset.path || state.currentPath).catch((error) => showToast(error.message)));
   $("#duplicates-trash").addEventListener("click", trashDuplicateSelection);
+  $("#duplicate-compare-play").addEventListener("click", toggleDuplicateComparePlayback);
+  $("#duplicate-compare-zoom-in").addEventListener("click", () => adjustDuplicateCompareZoom(1.5));
+  $("#duplicate-compare-zoom-out").addEventListener("click", () => adjustDuplicateCompareZoom(1 / 1.5));
+  $("#duplicate-compare-full").addEventListener("click", async () => {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await $("#duplicate-compare").requestFullscreen();
+    } catch (_) { showToast("Fullscreen is not available in this browser"); }
+  });
+  $("#duplicate-compare-seek").addEventListener("input", (event) => {
+    const ratio = Number(event.target.value) / 1000;
+    $$("#duplicate-compare-grid video").forEach((video) => {
+      if (Number.isFinite(video.duration)) video.currentTime = ratio * video.duration;
+    });
+  });
+  $("#duplicate-compare").addEventListener("close", () => {
+    $$("#duplicate-compare-grid video").forEach((video) => video.pause());
+    state.duplicateCompareGroup = null;
+  });
   $("#background-job-view").addEventListener("click", () => viewDuplicateJob().catch((error) => showToast(error.message)));
   $("#background-job-dismiss").addEventListener("click", () => $("#background-job").classList.add("hidden"));
   $("#rename-button").addEventListener("click", openRename);
@@ -1692,6 +1835,7 @@ function bindEvents() {
   $("#seek").addEventListener("pointermove", showSeekPreview);
   $("#seek").addEventListener("pointerleave", () => { clearTimeout(state.seekPreviewTimer); $("#seek-preview").classList.add("hidden"); });
   $("#seek").addEventListener("pointerdown", showSeekPreview);
+  $("#seek").addEventListener("pointerup", (event) => event.currentTarget.blur());
   $("#seek").addEventListener("wheel", scrubWithWheel, { passive: false });
   $("#seek-preview-image").addEventListener("error", (event) => {
     if (!state.primary || event.target.dataset.fallback === "true") return;

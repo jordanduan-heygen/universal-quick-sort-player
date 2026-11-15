@@ -229,6 +229,24 @@
     <div id="duplicates-results" class="duplicates-results"></div>
   </dialog>
 
+  <dialog id="duplicate-compare" class="dialog duplicate-compare-dialog">
+    <header class="dialog-head">
+      <div><h2>Compare duplicates</h2><p id="duplicate-compare-summary">Review quality before choosing what to keep.</p></div>
+      <div class="dialog-head-actions">
+        <button id="duplicate-compare-play" type="button">Play all</button>
+        <button id="duplicate-compare-zoom-out" type="button" title="Zoom out">−</button>
+        <button id="duplicate-compare-zoom-in" type="button" title="Zoom in">+</button>
+        <button id="duplicate-compare-full" type="button">Full</button>
+        <button type="button" class="close-dialog" data-close="duplicate-compare">Close</button>
+      </div>
+    </header>
+    <div id="duplicate-compare-grid" class="duplicate-compare-grid"></div>
+    <footer class="duplicate-compare-footer">
+      <label>Synced position <input id="duplicate-compare-seek" type="range" min="0" max="1000" value="0"></label>
+      <span>Green is stronger · red is weaker · nothing is removed until you confirm</span>
+    </footer>
+  </dialog>
+
   <dialog id="rename" class="dialog rename-dialog">
     <form id="rename-form">
       <header class="dialog-head"><div><h2>Batch rename</h2><p>Use {name}, {index}, and {date}. Extensions are preserved.</p></div><button type="button" class="close-dialog" data-close="rename">Close</button></header>

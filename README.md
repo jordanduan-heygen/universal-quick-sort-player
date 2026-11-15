@@ -21,7 +21,7 @@ pixel level. The app binds to `127.0.0.1` only: files never leave your computer.
 - Ordered fullscreen review: numbered sort keys advance to the next image/video in the visible queue, and `Ctrl+Z` restores and reselects mistaken moves
 - Keep/Reject queues, ratings, tags, review progress, and resumable folder sessions
 - Side-by-side media comparison with synchronized playback and zoom
-- Exact and visual duplicate finding, batch rename previews, and metadata inspection
+- Exact and visual duplicate finding with full-resolution side-by-side comparison, quality-ranked metadata, synchronized video playback, and safe keeper selection
 - Local fuzzy search across names, types, tags, ratings, and review status
 - Collapsible Library, file rail, Places, and destination sections
 - Fully customizable keyboard shortcuts
