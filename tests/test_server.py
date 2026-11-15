@@ -437,3 +437,20 @@ def test_cached_video_sprite_endpoint(tmp_path: Path, monkeypatch):
     assert response.status_code == 200
     assert response.headers["x-sprite-columns"] == "10"
     assert response.headers["x-sprite-count"] == "40"
+
+
+def test_video_sprite_generates_from_real_ffmpeg_probe(tmp_path: Path, monkeypatch):
+    """The sprite endpoint probes duration with FFmpeg, which exits 1 for probes only."""
+    monkeypatch.setattr(server, "THUMB_DIR", tmp_path / "cache")
+    media = tmp_path / "tiny.mp4"
+    subprocess.run(
+        [
+            server.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10:duration=1",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(media),
+        ],
+        check=True, capture_output=True, timeout=120,
+    )
+    response = client.get("/api/video-sprite", params={"path": str(media), "count": 10})
+    assert response.status_code == 200
+    assert response.content[:2] == b"\xff\xd8"
