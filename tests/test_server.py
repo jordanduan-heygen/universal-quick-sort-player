@@ -50,6 +50,24 @@ def test_static_app_loads():
     assert "Quick Sort" in response.text
 
 
+def test_media_supports_seekable_byte_ranges(tmp_path: Path):
+    video = tmp_path / "large.mp4"
+    video.write_bytes(b"0123456789")
+    response = client.get("/api/media", params={"path": str(video)}, headers={"Range": "bytes=2-5"})
+    assert response.status_code == 206
+    assert response.content == b"2345"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["content-range"] == "bytes 2-5/10"
+    assert response.headers["content-length"] == "4"
+
+    suffix = client.get("/api/media", params={"path": str(video)}, headers={"Range": "bytes=-3"})
+    assert suffix.status_code == 206
+    assert suffix.content == b"789"
+
+    invalid = client.get("/api/media", params={"path": str(video)}, headers={"Range": "bytes=20-30"})
+    assert invalid.status_code == 416
+
+
 def test_review_state_round_trip(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(server, "REVIEW_FILE", tmp_path / "review.json")
     photo = tmp_path / "photo.jpg"

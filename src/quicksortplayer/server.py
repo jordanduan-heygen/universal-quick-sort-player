@@ -17,8 +17,8 @@ import zipfile
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from imageio_ffmpeg import get_ffmpeg_exe
 from PIL import Image, ImageOps
@@ -292,9 +292,43 @@ def thumb_cache_path(path: Path, marker: str = "thumb") -> Path:
     return THUMB_DIR / f"{digest}.jpg"
 
 
+def temporary_image_path(destination: Path) -> Path:
+    return destination.with_name(
+        f"{destination.stem}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp.jpg"
+    )
+
+
+def extract_video_image(path: Path, destination: Path, seconds: float, scale: str, timeout: int = 60) -> None:
+    temporary = temporary_image_path(destination)
+    attempts = [
+        ["-ss", str(max(0, seconds)), "-i", str(path)],
+        ["-i", str(path), "-ss", str(max(0, seconds))],
+        ["-ss", "0", "-i", str(path)],
+    ]
+    last_error: Exception | None = None
+    try:
+        for input_args in attempts:
+            temporary.unlink(missing_ok=True)
+            command = [
+                get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", *input_args,
+                "-map", "0:v:0", "-an", "-frames:v", "1", "-vf", scale,
+                "-q:v", "4", "-y", str(temporary),
+            ]
+            try:
+                subprocess.run(command, check=True, timeout=timeout)
+                if temporary.exists() and temporary.stat().st_size:
+                    temporary.replace(destination)
+                    return
+            except (subprocess.SubprocessError, OSError) as error:
+                last_error = error
+        raise ValueError("No decodable video frame was found") from last_error
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def create_thumbnail(path: Path, destination: Path) -> None:
     THUMB_DIR.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(".tmp.jpg")
+    temporary = temporary_image_path(destination)
     suffix = path.suffix.lower()
     if suffix == ".svg":
         document = pymupdf.open(stream=path.read_bytes(), filetype="svg")
@@ -315,13 +349,11 @@ def create_thumbnail(path: Path, destination: Path) -> None:
             image.thumbnail((MAX_THUMB_EDGE, MAX_THUMB_EDGE), Image.Resampling.LANCZOS)
             image.convert("RGB").save(temporary, "JPEG", quality=84, optimize=True)
     elif suffix in VIDEO_EXTENSIONS:
-        command = [
-            get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-ss", "1",
-            "-i", str(path), "-frames:v", "1", "-vf",
+        extract_video_image(
+            path, destination, 1,
             f"scale={MAX_THUMB_EDGE}:{MAX_THUMB_EDGE}:force_original_aspect_ratio=decrease",
-            "-q:v", "4", "-y", str(temporary),
-        ]
-        subprocess.run(command, check=True, timeout=30)
+        )
+        return
     elif suffix in AUDIO_EXTENSIONS:
         command = [
             get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", str(path),
@@ -359,14 +391,7 @@ def create_rendered_image(path: Path, destination: Path) -> None:
 
 def create_video_frame(path: Path, destination: Path, seconds: float) -> None:
     THUMB_DIR.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(".tmp.jpg")
-    command = [
-        get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-ss", str(max(0, seconds)),
-        "-i", str(path), "-frames:v", "1", "-vf",
-        "scale=480:270:force_original_aspect_ratio=decrease", "-q:v", "4", "-y", str(temporary),
-    ]
-    subprocess.run(command, check=True, timeout=30)
-    temporary.replace(destination)
+    extract_video_image(path, destination, seconds, "scale=480:270:force_original_aspect_ratio=decrease")
 
 
 def media_duration(path: Path) -> float:
@@ -669,11 +694,51 @@ def list_directory(path: str = Query(default=str(Path.home())), show_hidden: boo
     return {"path": str(folder), "parent": parent, "items": items}
 
 
-@app.get("/api/media")
-def media(path: str) -> FileResponse:
+def file_range(path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
+    with path.open("rb") as source:
+        source.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            chunk = source.read(min(chunk_size, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
+@app.api_route("/api/media", methods=["GET", "HEAD"])
+def media(path: str, request: Request) -> Response:
     file_path = checked_path(path, require_file=True)
     media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-    return FileResponse(file_path, media_type=media_type, filename=file_path.name, content_disposition_type="inline")
+    size = file_path.stat().st_size
+    start, end = 0, max(0, size - 1)
+    status_code = 200
+    range_header = request.headers.get("range")
+    if range_header:
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+        if not match:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+        first, last = match.groups()
+        if first:
+            start = int(first)
+            end = min(int(last) if last else end, end)
+        elif last:
+            length = min(int(last), size)
+            start = size - length
+        if start > end or start >= size:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+        status_code = 206
+    length = max(0, end - start + 1)
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(length),
+        "Content-Disposition": f'inline; filename="{file_path.name.replace(chr(34), "")}"',
+    }
+    if status_code == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    if request.method == "HEAD":
+        return Response(status_code=status_code, media_type=media_type, headers=headers)
+    return StreamingResponse(file_range(file_path, start, end), status_code=status_code, media_type=media_type, headers=headers)
 
 
 @app.get("/api/thumbnail")

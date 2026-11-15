@@ -45,7 +45,11 @@ const state = {
   audioAnalysis: null,
   sprite: null,
   scrub: JSON.parse(localStorage.getItem("quick-sort-scrub") || '{"normal":5,"fast":30,"fine":1}'),
+  enhancementTimer: null,
+  enhancedPath: null,
 };
+
+const LARGE_MEDIA_BYTES = 512 * 1024 * 1024;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -828,6 +832,9 @@ function resetPreviewElements() {
   videoPreview.pause();
   videoPreview.removeAttribute("src");
   videoPreview.load();
+  clearTimeout(state.enhancementTimer);
+  state.enhancementTimer = null;
+  state.enhancedPath = null;
   state.audioAnalysis = null;
   state.sprite = null;
   drawWaveform();
@@ -872,7 +879,6 @@ function showPreview(item) {
     $("#transport").classList.remove("hidden");
     $("#zoom-controls").classList.toggle("hidden", item.preview_type === "audio");
     videoPreview.play().catch(() => { /* Browser may require one click before audio playback. */ });
-    loadAudioAnalysis(item.path);
   } else if (item.preview_type === "pdf") {
     $("#document-preview").src = endpoint("/api/media", { path: item.path });
     $("#document-preview").classList.remove("hidden");
@@ -935,11 +941,40 @@ function buildFilmstrip() {
     const ratio = index / 9 * .98;
     return Math.max(0, videoPreview.duration * ratio);
   });
+  const large = state.primary.size >= LARGE_MEDIA_BYTES;
   $("#filmstrip").innerHTML = times.map((seconds) => `
-    <button data-film-time="${seconds}" title="${formatTime(seconds)}"><img loading="lazy" src="${endpoint("/api/video-frame", { path: state.primary.path, time: seconds })}" alt="Frame at ${formatTime(seconds)}"></button>
+    <button data-film-time="${seconds}" title="${formatTime(seconds)}"><img loading="lazy" ${large ? "" : `src="${endpoint("/api/video-frame", { path: state.primary.path, time: seconds })}"`} data-frame-src="${endpoint("/api/video-frame", { path: state.primary.path, time: seconds })}" alt="Frame at ${formatTime(seconds)}"></button>
   `).join("");
   $("#filmstrip").classList.remove("hidden");
   $$("#filmstrip [data-film-time]").forEach((button) => button.addEventListener("click", () => { videoPreview.currentTime = Number(button.dataset.filmTime); }));
+  const filmstripPath = state.primary.path;
+  $$("#filmstrip img").forEach((image) => image.addEventListener("error", () => {
+    if (image.dataset.usedFallback === "true") {
+      image.closest("button")?.classList.add("frame-failed");
+      image.removeAttribute("src");
+      return;
+    }
+    image.dataset.usedFallback = "true";
+    image.src = endpoint("/api/thumbnail", { path: filmstripPath });
+  }));
+  if (large) $$("#filmstrip img").forEach((image, index) => setTimeout(() => {
+    if (state.primary?.path === filmstripPath && image.isConnected && !image.getAttribute("src")) image.src = image.dataset.frameSrc;
+  }, 500 + index * 350));
+}
+
+function scheduleMediaEnhancements(item) {
+  if (!item || state.enhancedPath === item.path) return;
+  state.enhancedPath = item.path;
+  clearTimeout(state.enhancementTimer);
+  const large = item.size >= LARGE_MEDIA_BYTES;
+  state.enhancementTimer = setTimeout(() => {
+    if (state.primary?.path !== item.path) return;
+    buildFilmstrip();
+    if (!large) {
+      loadAudioAnalysis(item.path);
+      if (item.preview_type === "video") prepareVideoSprite(item.path);
+    }
+  }, large ? 1200 : 150);
 }
 
 function nextVideoInLine() {
@@ -967,9 +1002,11 @@ function preloadNextVideo() {
   const controller = new AbortController();
   state.preloadController = controller;
   nextVideoPreload.src = endpoint("/api/media", { path: next.path });
+  nextVideoPreload.preload = "metadata";
   nextVideoPreload.load();
   nextVideoPreload.addEventListener("loadedmetadata", async () => {
     if (state.preloadedNextPath !== next.path || controller.signal.aborted || !Number.isFinite(nextVideoPreload.duration)) return;
+    if (next.size >= LARGE_MEDIA_BYTES) return;
     const times = Array.from({ length: 10 }, (_, index) => nextVideoPreload.duration * (index / 9 * .98));
     for (let index = 0; index < times.length; index += 2) {
       if (controller.signal.aborted) return;
@@ -1924,10 +1961,12 @@ function bindEvents() {
     applyZoom();
     const record = currentMediaState();
     if (Number.isFinite(record.resume) && record.resume > 0 && record.resume < videoPreview.duration - 2) videoPreview.currentTime = record.resume;
-    buildFilmstrip();
-    prepareVideoSprite(state.primary.path);
     renderTimelineOverlays();
     updateSeekVisuals();
+  });
+  videoPreview.addEventListener("canplay", () => scheduleMediaEnhancements(state.primary));
+  videoPreview.addEventListener("error", () => {
+    if (state.primary?.preview_type === "video") showToast("This codec cannot play in the browser. Use Tools → Open externally for the original file.");
   });
   videoPreview.addEventListener("timeupdate", () => {
     const record = currentMediaState();
