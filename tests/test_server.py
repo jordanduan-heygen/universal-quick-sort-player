@@ -1,7 +1,10 @@
 from pathlib import Path
+import zipfile
 
 from fastapi.testclient import TestClient
 from PIL import Image
+from pillow_heif import from_pillow
+import pymupdf
 
 from quicksortplayer import server
 from quicksortplayer.server import app
@@ -85,3 +88,33 @@ def test_custom_shortcuts_are_persisted(tmp_path: Path, monkeypatch):
     assert response.status_code == 200
     assert response.json()["keybindings"]["keep"] == "Q"
     assert server.load_config()["labels"]["photos"] == "Best photos"
+
+
+def test_heic_thumbnail_and_browser_render(tmp_path: Path):
+    path = tmp_path / "photo.heic"
+    from_pillow(Image.new("RGB", (120, 80), "#4cb3f0")).save(path)
+    thumbnail = client.get("/api/thumbnail", params={"path": str(path)})
+    rendered = client.get("/api/rendered-image", params={"path": str(path)})
+    assert thumbnail.status_code == 200
+    assert rendered.status_code == 200
+    assert rendered.headers["content-type"].startswith("image/jpeg")
+
+
+def test_pdf_text_and_archive_previews(tmp_path: Path):
+    pdf = tmp_path / "document.pdf"
+    document = pymupdf.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Quick Sort PDF")
+    document.save(pdf)
+    document.close()
+    assert client.get("/api/thumbnail", params={"path": str(pdf)}).status_code == 200
+
+    text = tmp_path / "notes.md"
+    text.write_text("# Notes\nHello files")
+    assert "Hello files" in client.get("/api/text-preview", params={"path": str(text)}).json()["content"]
+
+    archive = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("inside/readme.txt", "hello")
+    entries = client.get("/api/archive-preview", params={"path": str(archive)}).json()["entries"]
+    assert "inside/readme.txt" in entries

@@ -71,6 +71,11 @@
         <button data-review-filter="keep">Kept</button>
         <button data-review-filter="reject">Rejected</button>
       </div>
+      <div class="arrange-row">
+        <label>Sort <select id="sort-by"><option value="name">Name</option><option value="modified">Date</option><option value="size">Size</option><option value="type">Type</option><option value="rating">Rating</option><option value="status">Status</option></select></label>
+        <button id="sort-direction" title="Reverse sort" aria-label="Reverse sort">↑</button>
+        <label>Group <select id="group-by"><option value="none">None</option><option value="type">Type</option><option value="date">Date</option><option value="rating">Rating</option><option value="status">Status</option><option value="extension">Extension</option><option value="size">Size</option></select></label>
+      </div>
       <div id="file-list" class="file-list" role="listbox" aria-label="Files and folders" tabindex="0"></div>
     </section>
 
@@ -107,6 +112,8 @@
         </div>
         <img id="image-preview" class="media-preview hidden" alt="">
         <video id="video-preview" class="media-preview hidden" preload="metadata"></video>
+        <iframe id="document-preview" class="document-preview hidden" title="Document preview"></iframe>
+        <pre id="text-preview" class="text-preview hidden"></pre>
         <div id="file-preview" class="file-preview hidden">
           <span id="file-extension">FILE</span>
           <strong id="file-preview-name"></strong>

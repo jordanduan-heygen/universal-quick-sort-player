@@ -10,6 +10,8 @@ import subprocess
 import sys
 import threading
 import time
+import tarfile
+import zipfile
 from pathlib import Path
 from typing import Literal
 
@@ -18,6 +20,8 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from imageio_ffmpeg import get_ffmpeg_exe
 from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
+import pymupdf
 from pydantic import BaseModel
 from send2trash import send2trash
 from starlette.concurrency import run_in_threadpool
@@ -33,6 +37,15 @@ THUMB_DIR = STATE_DIR / "thumbnails"
 CONFIG_FILE = STATE_DIR / "config.json"
 REVIEW_FILE = STATE_DIR / "review.json"
 MAX_THUMB_EDGE = 320
+TEXT_EXTENSIONS = {
+    ".bat", ".c", ".cc", ".cfg", ".conf", ".cpp", ".cs", ".css", ".csv", ".env", ".go", ".h", ".hpp",
+    ".html", ".ini", ".java", ".js", ".json", ".jsx", ".log", ".lua", ".md", ".mjs", ".php", ".plist",
+    ".ps1", ".py", ".rb", ".rs", ".sh", ".sql", ".toml", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml",
+}
+ARCHIVE_EXTENSIONS = {".7z", ".bz2", ".gz", ".rar", ".tar", ".tgz", ".xz", ".zip"}
+BROWSER_IMAGE_EXTENSIONS = {".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
+
+register_heif_opener()
 
 app = FastAPI(title="Quick Sort Player", docs_url=None, redoc_url=None)
 undo_stack: list[list[MoveRecord]] = []
@@ -156,9 +169,10 @@ def human_kind(path: Path) -> str:
     suffix = path.suffix.lower().removeprefix(".")
     labels = {
         "jpg": "JPEG image", "jpeg": "JPEG image", "png": "PNG image", "gif": "GIF image",
-        "webp": "WebP image", "heic": "HEIC image", "mp4": "MP4 video", "mov": "QuickTime video",
+        "webp": "WebP image", "heic": "HEIC image", "heif": "HEIF image", "mp4": "MP4 video", "mov": "QuickTime video",
         "mkv": "Matroska video", "webm": "WebM video", "mp3": "MP3 audio", "wav": "WAV audio",
-        "pdf": "PDF document", "exe": "Windows application", "msi": "Windows installer",
+        "pdf": "PDF document", "csv": "CSV table", "json": "JSON document", "md": "Markdown document",
+        "zip": "ZIP archive", "exe": "Windows application", "msi": "Windows installer",
     }
     return labels.get(suffix, f"{suffix.upper()} file" if suffix else "File")
 
@@ -167,7 +181,33 @@ def item_payload(path: Path) -> dict[str, object]:
     stat = path.stat()
     category = "folder" if path.is_dir() else category_for(path)
     suffix = path.suffix.lower()
-    previewable = suffix in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
+    if suffix == ".ts" and path.is_file():
+        try:
+            sample = path.read_bytes()[:4096]
+            looks_like_text = b"\x00" not in sample and sum(byte in b"\t\n\r" or 32 <= byte < 127 for byte in sample) >= len(sample) * .9
+            if looks_like_text:
+                category = "files"
+        except OSError:
+            looks_like_text = False
+    else:
+        looks_like_text = False
+    if suffix == ".ts" and looks_like_text:
+        preview_type = "text"
+    elif suffix in IMAGE_EXTENSIONS:
+        preview_type = "image"
+    elif suffix in VIDEO_EXTENSIONS:
+        preview_type = "video"
+    elif suffix in AUDIO_EXTENSIONS:
+        preview_type = "audio"
+    elif suffix == ".pdf":
+        preview_type = "pdf"
+    elif suffix in TEXT_EXTENSIONS or (mimetypes.guess_type(path.name)[0] or "").startswith("text/"):
+        preview_type = "text"
+    elif suffix in ARCHIVE_EXTENSIONS:
+        preview_type = "archive"
+    else:
+        preview_type = "file"
+    previewable = preview_type != "file"
     return {
         "name": path.name,
         "path": str(path),
@@ -178,7 +218,9 @@ def item_payload(path: Path) -> dict[str, object]:
         "size": 0 if path.is_dir() else stat.st_size,
         "modified": stat.st_mtime,
         "previewable": previewable,
-        "thumbnail": previewable,
+        "preview_type": preview_type,
+        "browser_native": suffix in BROWSER_IMAGE_EXTENSIONS,
+        "thumbnail": preview_type in {"image", "video", "audio", "pdf"},
     }
 
 
@@ -214,7 +256,13 @@ def create_thumbnail(path: Path, destination: Path) -> None:
     THUMB_DIR.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".tmp.jpg")
     suffix = path.suffix.lower()
-    if suffix in IMAGE_EXTENSIONS:
+    if suffix == ".svg":
+        document = pymupdf.open(stream=path.read_bytes(), filetype="svg")
+        page = document[0]
+        pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
+        pixmap.save(str(temporary))
+        document.close()
+    elif suffix in IMAGE_EXTENSIONS:
         with Image.open(path) as image:
             image = ImageOps.exif_transpose(image)
             if image.mode not in {"RGB", "L"}:
@@ -234,8 +282,38 @@ def create_thumbnail(path: Path, destination: Path) -> None:
             "-q:v", "4", "-y", str(temporary),
         ]
         subprocess.run(command, check=True, timeout=30)
+    elif suffix in AUDIO_EXTENSIONS:
+        command = [
+            get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", str(path),
+            "-filter_complex", "showwavespic=s=640x320:colors=4cb3f0", "-frames:v", "1", "-y", str(temporary),
+        ]
+        subprocess.run(command, check=True, timeout=30)
+    elif suffix == ".pdf":
+        document = pymupdf.open(path)
+        if not document.page_count:
+            raise ValueError("Empty PDF")
+        pixmap = document[0].get_pixmap(matrix=pymupdf.Matrix(1.4, 1.4), alpha=False)
+        pixmap.save(str(temporary))
+        document.close()
     else:
         raise ValueError("No thumbnail generator for this file type")
+    temporary.replace(destination)
+
+
+def create_rendered_image(path: Path, destination: Path) -> None:
+    THUMB_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(".tmp.jpg")
+    with Image.open(path) as image:
+        image = ImageOps.exif_transpose(image)
+        image.thumbnail((2400, 2400), Image.Resampling.LANCZOS)
+        if image.mode not in {"RGB", "L"}:
+            background = Image.new("RGB", image.size, "#111111")
+            if "A" in image.getbands():
+                background.paste(image, mask=image.getchannel("A"))
+            else:
+                background.paste(image)
+            image = background
+        image.convert("RGB").save(temporary, "JPEG", quality=92, optimize=True)
     temporary.replace(destination)
 
 
@@ -306,7 +384,7 @@ def find_duplicates(folder: Path) -> dict[str, object]:
 
 def index_folder(folder: Path) -> None:
     key = str(folder)
-    paths = [path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS]
+    paths = [path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | AUDIO_EXTENSIONS | {".pdf"}]
     index_jobs[key] = {"status": "running", "done": 0, "total": len(paths)}
     for number, path in enumerate(paths, 1):
         try:
@@ -395,6 +473,48 @@ async def thumbnail(path: str) -> Response:
         except Exception:
             return Response(status_code=204)
     return FileResponse(destination, media_type="image/jpeg")
+
+
+@app.get("/api/rendered-image")
+async def rendered_image(path: str) -> Response:
+    file_path = checked_path(path, require_file=True)
+    if file_path.suffix.lower() not in IMAGE_EXTENSIONS:
+        raise HTTPException(400, "An image file is required")
+    destination = thumb_cache_path(file_path, "rendered:2400")
+    if not destination.exists():
+        try:
+            await run_in_threadpool(create_rendered_image, file_path, destination)
+        except Exception as error:
+            raise HTTPException(415, f"This image codec could not be decoded: {file_path.suffix}") from error
+    return FileResponse(destination, media_type="image/jpeg")
+
+
+@app.get("/api/text-preview")
+def text_preview(path: str) -> dict[str, object]:
+    file_path = checked_path(path, require_file=True)
+    raw = file_path.read_bytes()[:512_000]
+    if b"\x00" in raw[:8192]:
+        raise HTTPException(415, "This file is binary")
+    content = raw.decode("utf-8", errors="replace")
+    return {"content": content, "truncated": file_path.stat().st_size > len(raw), "encoding": "UTF-8"}
+
+
+@app.get("/api/archive-preview")
+def archive_preview(path: str) -> dict[str, object]:
+    file_path = checked_path(path, require_file=True)
+    names: list[str] = []
+    try:
+        if zipfile.is_zipfile(file_path):
+            with zipfile.ZipFile(file_path) as archive:
+                names = archive.namelist()[:2000]
+        elif tarfile.is_tarfile(file_path):
+            with tarfile.open(file_path) as archive:
+                names = [member.name for member in archive.getmembers()[:2000]]
+        else:
+            return {"entries": [], "supported": False, "message": "Open this archive in the default app to inspect it."}
+    except (OSError, zipfile.BadZipFile, tarfile.TarError) as error:
+        raise HTTPException(415, str(error)) from error
+    return {"entries": names, "supported": True, "truncated": len(names) == 2000}
 
 
 @app.get("/api/video-frame")

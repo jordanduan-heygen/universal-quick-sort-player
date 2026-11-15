@@ -26,6 +26,9 @@ const state = {
   reviewFilter: "all",
   compareZoom: 1,
   indexTimer: null,
+  sortBy: localStorage.getItem("quick-sort-sort-by") || "name",
+  sortDirection: localStorage.getItem("quick-sort-sort-direction") || "asc",
+  groupBy: localStorage.getItem("quick-sort-group-by") || "none",
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -395,6 +398,47 @@ function itemMatches(item) {
   return queryMatch && categoryMatch && reviewMatch;
 }
 
+function groupLabel(item) {
+  if (item.is_dir) return "Folders";
+  const record = state.review[item.path] || {};
+  if (state.groupBy === "type") return item.category === "videos" && item.preview_type === "audio" ? "Audio" : item.kind;
+  if (state.groupBy === "date") return new Intl.DateTimeFormat(undefined, { month: "long", year: "numeric" }).format(new Date(item.modified * 1000));
+  if (state.groupBy === "rating") return record.rating ? `${record.rating} star${record.rating === 1 ? "" : "s"}` : "Unrated";
+  if (state.groupBy === "status") return (record.status || "unreviewed").replace(/^./, (letter) => letter.toUpperCase());
+  if (state.groupBy === "extension") return item.extension ? item.extension.slice(1).toUpperCase() : "No extension";
+  if (state.groupBy === "size") {
+    if (item.size < 1024 * 1024) return "Under 1 MB";
+    if (item.size < 100 * 1024 * 1024) return "1–100 MB";
+    if (item.size < 1024 * 1024 * 1024) return "100 MB–1 GB";
+    return "Over 1 GB";
+  }
+  return "";
+}
+
+function sortItems(items) {
+  const direction = state.sortDirection === "desc" ? -1 : 1;
+  const statusOrder = { keep: 0, unreviewed: 1, reject: 2 };
+  const value = (item) => {
+    const record = state.review[item.path] || {};
+    if (state.sortBy === "modified") return item.modified;
+    if (state.sortBy === "size") return item.size;
+    if (state.sortBy === "type") return `${item.category}:${item.kind}`;
+    if (state.sortBy === "rating") return record.rating || 0;
+    if (state.sortBy === "status") return statusOrder[record.status || "unreviewed"];
+    return item.name;
+  };
+  return [...items].sort((left, right) => {
+    if (state.groupBy !== "none") {
+      const groupCompare = groupLabel(left).localeCompare(groupLabel(right), undefined, { numeric: true });
+      if (groupCompare) return groupCompare;
+    }
+    if (left.is_dir !== right.is_dir) return left.is_dir ? -1 : 1;
+    const leftValue = value(left); const rightValue = value(right);
+    const comparison = typeof leftValue === "number" ? leftValue - rightValue : String(leftValue).localeCompare(String(rightValue), undefined, { numeric: true, sensitivity: "base" });
+    return comparison * direction;
+  });
+}
+
 function hideHoverPreview() {
   clearTimeout(state.hoverTimer);
   state.hoverTimer = null;
@@ -432,7 +476,7 @@ function queueHoverPreview(item, row) {
       hoverPreviewVideo.classList.remove("hidden");
       hoverPreviewVideo.play().catch(() => { /* Unsupported codecs still retain the static thumbnail. */ });
     } else {
-      hoverPreviewImage.src = endpoint("/api/media", { path: item.path });
+      hoverPreviewImage.src = endpoint(item.browser_native ? "/api/media" : "/api/rendered-image", { path: item.path });
       hoverPreviewImage.alt = item.name;
       hoverPreviewImage.classList.remove("hidden");
     }
@@ -443,7 +487,9 @@ function queueHoverPreview(item, row) {
 
 function renderFiles({ preserveScroll = false } = {}) {
   state.visibleItems = state.items.filter(itemMatches);
-  if (state.query.trim()) state.visibleItems.sort((left, right) => searchScore(right) - searchScore(left));
+  state.visibleItems = state.query.trim()
+    ? [...state.visibleItems].sort((left, right) => searchScore(right) - searchScore(left))
+    : sortItems(state.visibleItems);
   const list = $("#file-list");
   const previousScroll = preserveScroll ? list.scrollTop : 0;
   const countLabel = `${state.visibleItems.length} ${state.visibleItems.length === 1 ? "item" : "items"}`;
@@ -453,17 +499,21 @@ function renderFiles({ preserveScroll = false } = {}) {
     return;
   }
   const renderedItems = state.visibleItems.slice(0, state.renderLimit);
+  let previousGroup = null;
   list.innerHTML = renderedItems.map((item) => {
     const review = state.review[item.path] || {};
+    const currentGroup = state.groupBy === "none" ? null : groupLabel(item);
+    const groupHeader = currentGroup !== null && currentGroup !== previousGroup ? `<div class="group-header">${escapeHtml(currentGroup)}</div>` : "";
+    previousGroup = currentGroup;
     let thumbnail;
     if (item.is_dir) {
       thumbnail = '<span class="thumbnail folder-thumb"><i class="folder-shape"></i></span>';
     } else if (item.thumbnail) {
-      thumbnail = `<span class="thumbnail"><img loading="lazy" src="${endpoint("/api/thumbnail", { path: item.path })}" alt=""></span>`;
+      thumbnail = `<span class="thumbnail" data-ext="${escapeHtml((item.extension || "file").replace(".", "").slice(0, 5).toUpperCase())}"><img loading="lazy" src="${endpoint("/api/thumbnail", { path: item.path })}" alt=""></span>`;
     } else {
       thumbnail = `<span class="thumbnail">${escapeHtml((item.extension || "file").replace(".", "").slice(0, 5).toUpperCase())}</span>`;
     }
-    return `
+    return `${groupHeader}
       <button class="file-row ${state.selected.has(item.path) ? "selected" : ""} status-${review.status || "unreviewed"}" role="option"
         draggable="${!item.is_dir}" aria-selected="${state.selected.has(item.path)}" data-path="${escapeHtml(item.path)}">
         ${thumbnail}
@@ -557,6 +607,10 @@ function resetPreviewElements() {
   videoPreview.classList.add("hidden");
   $("#empty-preview").classList.add("hidden");
   $("#file-preview").classList.add("hidden");
+  $("#document-preview").classList.add("hidden");
+  $("#document-preview").removeAttribute("src");
+  $("#text-preview").classList.add("hidden");
+  $("#text-preview").textContent = "";
   $("#transport").classList.add("hidden");
   $("#filmstrip").classList.add("hidden");
   $("#filmstrip").innerHTML = "";
@@ -588,23 +642,46 @@ function showPreview(item) {
   $("#selected-meta").textContent = `${item.kind} · ${formatBytes(item.size)} · ${new Date(item.modified * 1000).toLocaleString()}`;
   if (item.is_dir) {
     showFileFallback(item, "FOLDER");
-  } else if (item.category === "images") {
+  } else if (item.preview_type === "image") {
     imagePreview.alt = item.name;
-    imagePreview.src = endpoint("/api/media", { path: item.path });
+    imagePreview.src = endpoint(item.browser_native ? "/api/media" : "/api/rendered-image", { path: item.path });
     imagePreview.classList.remove("hidden");
     $("#zoom-controls").classList.remove("hidden");
-  } else if (item.category === "videos") {
+  } else if (item.preview_type === "video" || item.preview_type === "audio") {
     videoPreview.autoplay = true;
     videoPreview.playsInline = true;
+    videoPreview.classList.toggle("audio-player", item.preview_type === "audio");
+    if (item.preview_type === "audio") videoPreview.poster = endpoint("/api/thumbnail", { path: item.path });
+    else videoPreview.removeAttribute("poster");
     videoPreview.src = endpoint("/api/media", { path: item.path });
     videoPreview.classList.remove("hidden");
     $("#transport").classList.remove("hidden");
-    $("#zoom-controls").classList.remove("hidden");
+    $("#zoom-controls").classList.toggle("hidden", item.preview_type === "audio");
     videoPreview.play().catch(() => { /* Browser may require one click before audio playback. */ });
+  } else if (item.preview_type === "pdf") {
+    $("#document-preview").src = endpoint("/api/media", { path: item.path });
+    $("#document-preview").classList.remove("hidden");
+  } else if (item.preview_type === "text" || item.preview_type === "archive") {
+    showTextualPreview(item);
   } else {
     showFileFallback(item, (item.extension || "FILE").replace(".", "").toUpperCase());
   }
   updateActionBar();
+}
+
+async function showTextualPreview(item) {
+  const preview = $("#text-preview");
+  preview.classList.remove("hidden");
+  preview.textContent = "Loading preview…";
+  try {
+    if (item.preview_type === "archive") {
+      const data = await api(endpoint("/api/archive-preview", { path: item.path }));
+      preview.textContent = data.supported ? data.entries.join("\n") + (data.truncated ? "\n\n…more entries" : "") : data.message;
+    } else {
+      const data = await api(endpoint("/api/text-preview", { path: item.path }));
+      preview.textContent = data.content + (data.truncated ? "\n\n…preview truncated" : "");
+    }
+  } catch (error) { preview.textContent = error.message; }
 }
 
 function showFileFallback(item, extension) {
@@ -1004,6 +1081,9 @@ function handleKeydown(event) {
 }
 
 function bindEvents() {
+  $("#sort-by").value = state.sortBy;
+  $("#group-by").value = state.groupBy;
+  $("#sort-direction").textContent = state.sortDirection === "asc" ? "↑" : "↓";
   $("#toggle-library").addEventListener("click", () => togglePanel("library"));
   $("#toggle-files").addEventListener("click", () => togglePanel("files"));
   $("#collapse-library").addEventListener("click", () => togglePanel("library"));
@@ -1079,6 +1159,18 @@ function bindEvents() {
   $("#search").addEventListener("input", (event) => {
     state.query = event.target.value;
     state.renderLimit = 180;
+    renderFiles();
+  });
+  $("#sort-by").addEventListener("change", (event) => {
+    state.sortBy = event.target.value; localStorage.setItem("quick-sort-sort-by", state.sortBy); state.renderLimit = 180; renderFiles();
+  });
+  $("#group-by").addEventListener("change", (event) => {
+    state.groupBy = event.target.value; localStorage.setItem("quick-sort-group-by", state.groupBy); state.renderLimit = 180; renderFiles();
+  });
+  $("#sort-direction").addEventListener("click", () => {
+    state.sortDirection = state.sortDirection === "asc" ? "desc" : "asc";
+    localStorage.setItem("quick-sort-sort-direction", state.sortDirection);
+    $("#sort-direction").textContent = state.sortDirection === "asc" ? "↑" : "↓";
     renderFiles();
   });
   $("#file-list").addEventListener("scroll", (event) => {

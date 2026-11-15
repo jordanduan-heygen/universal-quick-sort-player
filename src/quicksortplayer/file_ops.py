@@ -7,13 +7,16 @@ from typing import Iterable
 
 
 IMAGE_EXTENSIONS = {
-    ".avif", ".bmp", ".gif", ".heic", ".jpeg", ".jpg", ".png", ".svg", ".tif", ".tiff", ".webp"
+    ".avif", ".bmp", ".dds", ".gif", ".heic", ".heif", ".ico", ".jfif", ".jpeg", ".jpg", ".jxl",
+    ".pbm", ".pgm", ".png", ".ppm", ".qoi", ".svg", ".tga", ".tif", ".tiff", ".webp"
 }
 VIDEO_EXTENSIONS = {
-    ".3gp", ".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm", ".wmv"
+    ".3gp", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".mts",
+    ".ogv", ".ts", ".vob", ".webm", ".wmv"
 }
 AUDIO_EXTENSIONS = {
-    ".aac", ".flac", ".m4a", ".mp3", ".oga", ".ogg", ".opus", ".wav", ".wma"
+    ".aac", ".aif", ".aiff", ".alac", ".ape", ".flac", ".m4a", ".mid", ".midi", ".mka", ".mp3",
+    ".oga", ".ogg", ".opus", ".wav", ".wma"
 }
 APP_EXTENSIONS = {
     ".app", ".appx", ".bat", ".cmd", ".com", ".exe", ".lnk", ".msi", ".msix", ".ps1"

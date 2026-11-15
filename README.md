@@ -29,6 +29,18 @@ pixel level. The app binds to `127.0.0.1` only: files never leave your computer.
 - Recent folders in the command palette
 - Automatic browser refresh while source files change
 
+## File support
+
+- Images: JPEG, PNG, GIF, WebP, AVIF, HEIC/HEIF, TIFF, BMP, SVG, ICO, and other Pillow-supported formats
+- Video: MP4, MOV, WebM, MKV, AVI, MPEG, MTS/M2TS, transport streams, WMV, FLV, OGV, and 3GP
+- Audio: MP3, M4A, AAC, WAV, FLAC, OGG/Opus, AIFF, ALAC, WMA, APE, and MIDI, with waveform thumbnails
+- Documents: inline PDF viewing and first-page thumbnails
+- Text and code: TXT, Markdown, CSV, JSON, XML, YAML, source code, logs, and configuration files
+- Archives: ZIP and TAR-family content listings; other archives open in the system app
+- Every other file remains sortable, searchable, taggable, inspectable, and openable in its default desktop application
+
+Sort and Group controls support name, date, size, type, extension, rating, and review status.
+
 ## Windows
 
 Install Python 3.11 or newer from [python.org](https://python.org/downloads/).
