@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from types import SimpleNamespace
@@ -253,6 +254,39 @@ def test_move_releases_active_media_streams(tmp_path: Path):
     finally:
         if not stream.closed:
             stream.close()
+
+
+def test_slow_move_does_not_block_other_media_requests(tmp_path: Path, monkeypatch):
+    moving = tmp_path / "moving.mp4"
+    moving.write_bytes(b"move me")
+    playing = tmp_path / "playing.mp4"
+    playing.write_bytes(b"play me while another file moves")
+    destination = tmp_path / "sorted"
+    move_started = threading.Event()
+    finish_move = threading.Event()
+
+    def slow_move(_paths, _destination):
+        move_started.set()
+        assert finish_move.wait(timeout=3)
+        return []
+
+    monkeypatch.setattr(server, "move_paths", slow_move)
+    response_holder = []
+    worker = threading.Thread(
+        target=lambda: response_holder.append(client.post(
+            "/api/move", json={"paths": [str(moving)], "destination": str(destination)},
+        )),
+    )
+    worker.start()
+    try:
+        assert move_started.wait(timeout=2)
+        media = client.get("/api/media", params={"path": str(playing)}, headers={"Range": "bytes=0-6"})
+        assert media.status_code == 206
+        assert media.content == b"play me"
+    finally:
+        finish_move.set()
+        worker.join(timeout=3)
+    assert response_holder[0].status_code == 200
 
 
 def test_trash_releases_active_media_streams(tmp_path: Path, monkeypatch):

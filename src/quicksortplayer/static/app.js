@@ -50,6 +50,8 @@ const state = {
   enhancedPath: null,
   proxyAttemptPath: null,
   filmstripSprites: new Map(),
+  moveQueue: Promise.resolve(),
+  pendingMoves: 0,
 };
 
 const LARGE_MEDIA_BYTES = 512 * 1024 * 1024;
@@ -1297,22 +1299,51 @@ async function movePathsToDestination(paths, destination) {
     ...queue.slice(Math.max(0, currentIndex + 1)),
     ...queue.slice(0, Math.max(0, currentIndex)).reverse(),
   ].find((item) => !remaining.has(item.path));
-  const releasedVideo = await releaseVideosForMove(paths);
-  try {
-    const result = await api("/api/move", { method: "POST", body: JSON.stringify({ paths, destination }) });
-    showToast(`Moved ${result.moved} item${result.moved === 1 ? "" : "s"} · Ctrl+Z to undo`);
-    await loadFolder(state.currentPath);
-    const queued = nextItem && state.items.find((item) => item.path === nextItem.path);
-    const fallback = state.visibleItems.find((item) => !item.is_dir);
-    if (queued || fallback) selectItem((queued || fallback).path);
-  } catch (error) {
-    if (releasedVideo && state.primary) showPreview(state.primary);
-    showToast(error.message);
-  }
+  const movedItems = state.items.filter((item) => remaining.has(item.path));
+  const sourceFolder = state.currentPath;
+
+  // Release only the file being moved, then advance immediately. A cross-drive
+  // move may copy gigabytes and must not hold the player on a blank frame while
+  // the request finishes in the background.
+  await releaseVideosForMove(paths);
+  state.items = state.items.filter((item) => !remaining.has(item.path));
+  paths.forEach((path) => state.selected.delete(path));
+  state.primary = null;
+  renderFiles({ preserveScroll: true });
+  updateActionBar();
+  updateProgress();
+  const queued = nextItem && state.items.find((item) => item.path === nextItem.path);
+  const fallback = state.visibleItems.find((item) => !item.is_dir);
+  if (queued || fallback) selectItem((queued || fallback).path);
+  else showPreview(null);
+
+  state.pendingMoves += 1;
+  showToast(`Moving ${paths.length} item${paths.length === 1 ? "" : "s"} in the background · keep sorting`);
+  state.moveQueue = state.moveQueue.catch(() => {}).then(async () => {
+    try {
+      const result = await api("/api/move", { method: "POST", body: JSON.stringify({ paths, destination }) });
+      showToast(`Moved ${result.moved} item${result.moved === 1 ? "" : "s"} · Ctrl+Z to undo`);
+    } catch (error) {
+      // Put failed items back without interrupting whatever is currently playing.
+      if (normalizedPath(state.currentPath) === normalizedPath(sourceFolder)) {
+        const currentPaths = new Set(state.items.map((item) => item.path));
+        state.items.push(...movedItems.filter((item) => !currentPaths.has(item.path)));
+        renderFiles({ preserveScroll: true });
+        updateProgress();
+      }
+      showToast(error.message);
+    } finally {
+      state.pendingMoves = Math.max(0, state.pendingMoves - 1);
+    }
+  });
 }
 
 async function undoMove() {
   try {
+    if (state.pendingMoves) {
+      showToast("Finishing queued moves before undo…");
+      await state.moveQueue;
+    }
     const result = await api("/api/undo", { method: "POST", body: "{}" });
     showToast(result.restored ? `Restored ${result.restored} item${result.restored === 1 ? "" : "s"}` : "Nothing to undo");
     await loadFolder(state.currentPath);
