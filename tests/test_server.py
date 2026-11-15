@@ -286,6 +286,30 @@ def test_cancel_media_work_stops_tracked_processes(tmp_path: Path):
             process.wait()
 
 
+def test_run_media_command_allows_probe_style_nonzero_exit(tmp_path: Path):
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video")
+    result = server.run_media_command(
+        [sys.executable, "-c", "import sys; print('probe output', file=sys.stderr); sys.exit(1)"],
+        source,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "probe output" in result.stderr
+
+
+def test_run_media_command_check_raises_for_failed_conversion(tmp_path: Path):
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video")
+    with pytest.raises(subprocess.CalledProcessError):
+        server.run_media_command(
+            [sys.executable, "-c", "import sys; sys.exit(1)"],
+            source,
+            check=True,
+        )
+
+
 def test_trash_retries_temporary_windows_file_lock(tmp_path: Path, monkeypatch):
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"video")

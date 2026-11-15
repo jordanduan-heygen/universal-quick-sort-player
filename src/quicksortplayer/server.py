@@ -518,9 +518,9 @@ def cancel_media_work(paths: list[Path]) -> int:
 
 def run_media_command(
     command: list[str], source: Path, *, timeout: float | None = None,
-    capture_output: bool = False, text: bool = False,
+    capture_output: bool = False, text: bool = False, check: bool = False,
 ) -> subprocess.CompletedProcess:
-    """Run FFmpeg with its source file registered so file operations can cancel it."""
+    """Run FFmpeg with its source registered, matching ``subprocess.run`` semantics."""
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE if capture_output else None,
@@ -536,7 +536,7 @@ def run_media_command(
         raise
     finally:
         untrack_media_process(source, process)
-    if process.returncode:
+    if check and process.returncode:
         raise subprocess.CalledProcessError(process.returncode, command, output=stdout, stderr=stderr)
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
@@ -571,7 +571,7 @@ def extract_video_image(path: Path, destination: Path, seconds: float, scale: st
                 "-q:v", "4", "-y", str(temporary),
             ]
             try:
-                run_media_command(command, path, timeout=timeout)
+                run_media_command(command, path, timeout=timeout, check=True)
                 if temporary.exists() and temporary.stat().st_size:
                     temporary.replace(destination)
                     return
@@ -615,7 +615,7 @@ def create_thumbnail(path: Path, destination: Path) -> None:
             get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", str(path),
             "-filter_complex", "showwavespic=s=640x320:colors=4cb3f0", "-frames:v", "1", "-y", str(temporary),
         ]
-        run_media_command(command, path, timeout=30)
+        run_media_command(command, path, timeout=30, check=True)
     elif suffix == ".pdf":
         document = pymupdf.open(path)
         if not document.page_count:
@@ -697,7 +697,7 @@ def create_video_sprite(path: Path, destination: Path, count: int = 40) -> None:
     run_media_command([
         get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", str(path),
         "-vf", filters, "-frames:v", "1", "-q:v", "5", "-y", str(temporary),
-    ], path, timeout=120)
+    ], path, timeout=120, check=True)
     temporary.replace(destination)
 
 
@@ -706,7 +706,7 @@ def analyze_audio(path: Path) -> dict[str, object]:
     pcm = run_media_command([
         get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", str(path),
         "-vn", "-ac", "1", "-ar", "100", "-f", "s16le", "-",
-    ], path, capture_output=True, timeout=120).stdout
+    ], path, capture_output=True, timeout=120, check=True).stdout
     values = array.array("h")
     values.frombytes(pcm[:len(pcm) - len(pcm) % 2])
     if sys.byteorder != "little":
@@ -769,7 +769,7 @@ def video_temporal_fingerprint(path: Path) -> dict[str, object] | None:
                     "-i", str(path), "-map", "0:v:0", "-an", "-frames:v", "1",
                     "-vf", "scale=8:8,format=gray", "-f", "rawvideo", "pipe:1",
                 ],
-                path, capture_output=True, timeout=30,
+                path, capture_output=True, timeout=30, check=True,
             ).stdout
             if len(frame) != 64:
                 return None
