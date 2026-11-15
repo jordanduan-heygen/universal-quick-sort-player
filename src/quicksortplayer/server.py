@@ -34,6 +34,7 @@ from .file_ops import (
     AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MoveRecord, category_for,
     move_paths, path_size, required_copy_space, undo_moves,
 )
+from . import __version__
 
 
 APP_STARTED = str(time.time_ns())
@@ -816,7 +817,7 @@ def source_version() -> str:
 
 @app.get("/api/health")
 def health() -> dict[str, object]:
-    return {"ok": True, "started": APP_STARTED, "version": source_version()}
+    return {"ok": True, "started": APP_STARTED, "version": source_version(), "app_version": __version__}
 
 
 @app.get("/api/locations")
@@ -1213,17 +1214,20 @@ def move(request: MoveRequest) -> dict[str, object]:
     try:
         records = move_paths(source_paths, destination)
     except PermissionError as error:
-        if getattr(error, "winerror", None) == 32:
+        windows_error = getattr(error, "winerror", None)
+        if windows_error == 32:
             raise HTTPException(
                 409,
                 "Windows still has this file open after several retries. Pause playback in other apps or "
                 "close any Explorer preview pane using the video, then retry.",
             ) from error
-        raise HTTPException(
-            403,
-            f"Windows blocked the move. A video may still be open, or {destination} may not allow writes. "
-            "Retry once; if it still fails, choose a writable folder or check its Security permissions.",
-        ) from error
+        if windows_error == 5:
+            raise HTTPException(
+                403,
+                f"Windows denied access to {destination} (WinError 5). Check that your account can write to "
+                "this folder and that Windows Security → Ransomware protection is not blocking Quick Sort Player.",
+            ) from error
+        raise HTTPException(403, f"Windows blocked the move to {destination} (error {windows_error or error.errno}): {error}") from error
     except OSError as error:
         if error.errno == 28 or getattr(error, "winerror", None) == 112:
             destination.mkdir(parents=True, exist_ok=True)
@@ -1273,8 +1277,9 @@ def trash(request: PathsRequest) -> dict[str, object]:
 def reveal(request: RevealRequest) -> dict[str, bool]:
     path = checked_path(request.path)
     if sys.platform == "win32":
-        # Explorer requires /select and the target as one argument to reliably highlight it.
-        subprocess.Popen(["explorer.exe", f"/select,{path}"])
+        # Pass the native command line verbatim. subprocess's list quoting can make Explorer
+        # treat /select and a path containing spaces as one malformed filename.
+        subprocess.Popen(f'explorer.exe /select,"{path}"')
     elif sys.platform == "darwin":
         subprocess.Popen(["open", "-R", str(path)])
     else:

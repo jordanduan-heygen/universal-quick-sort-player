@@ -105,7 +105,7 @@ def test_windows_reveal_selects_exact_file(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(server.subprocess, "Popen", lambda command: commands.append(command))
     response = client.post("/api/reveal", json={"path": str(video)})
     assert response.status_code == 200
-    assert commands == [["explorer.exe", f"/select,{video}"]]
+    assert commands == [f'explorer.exe /select,"{video}"']
 
 
 def test_review_state_round_trip(tmp_path: Path, monkeypatch):

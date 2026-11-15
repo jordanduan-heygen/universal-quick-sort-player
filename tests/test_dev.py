@@ -24,3 +24,17 @@ def test_existing_instance_reopens_without_second_server(monkeypatch):
 
     assert dev.main() == 0
     assert opened == ["http://127.0.0.1:8767"]
+
+
+def test_new_frozen_build_does_not_reopen_stale_server(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(dev.sys, "argv", ["Quick Sort Player.exe", "--no-browser"])
+    monkeypatch.setattr(dev.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(dev, "_quick_sort_is_running", lambda _port: True)
+    monkeypatch.setattr(dev, "_running_version", lambda _port: "0.2.5")
+    monkeypatch.setattr(dev, "_available_port", lambda _port: 8768)
+    monkeypatch.setattr(dev.uvicorn, "run", lambda app, **options: captured.update({"app": app, **options}))
+
+    assert dev.main() == 0
+    assert captured["port"] == 8768
+    assert captured["reload"] is False

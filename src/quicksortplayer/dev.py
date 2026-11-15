@@ -13,6 +13,8 @@ from pathlib import Path
 
 import uvicorn
 
+from . import __version__
+
 
 def _open_when_ready(url: str) -> None:
     time.sleep(1.2)
@@ -25,6 +27,14 @@ def _quick_sort_is_running(port: int) -> bool:
             return response.status == 200 and json.loads(response.read())["ok"] is True
     except Exception:
         return False
+
+
+def _running_version(port: int) -> str | None:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=.5) as response:
+            return str(json.loads(response.read()).get("app_version") or "") or None
+    except Exception:
+        return None
 
 
 def _port_is_available(port: int) -> bool:
@@ -49,13 +59,18 @@ def main() -> int:
     parser.add_argument("--no-reload", action="store_true")
     args = parser.parse_args()
 
-    if _quick_sort_is_running(args.port):
+    frozen = bool(getattr(sys, "frozen", False))
+    already_running = _quick_sort_is_running(args.port)
+    same_build = not frozen or not already_running or _running_version(args.port) == __version__
+    if already_running and same_build:
         url = f"http://127.0.0.1:{args.port}"
         print(f"Quick Sort Player is already running: {url}")
         if not args.no_browser:
             webbrowser.open(url)
         return 0
 
+    # A different packaged build may still own the default port. Start this build on the
+    # next port rather than silently reopening stale code.
     port = _available_port(args.port)
     url = f"http://127.0.0.1:{port}"
     if not args.no_browser:
@@ -63,7 +78,6 @@ def main() -> int:
     print(f"Quick Sort Player: {url}")
     print("Local-only server. Press Ctrl+C to stop.")
 
-    frozen = bool(getattr(sys, "frozen", False))
     source_dir = Path(__file__).resolve().parents[1]
     app_target = "quicksortplayer.server:app"
     if frozen:
