@@ -997,6 +997,12 @@ async function buildFilmstrip() {
   `).join("");
   $("#filmstrip").classList.remove("hidden");
   $$("#filmstrip [data-film-time]").forEach((button) => button.addEventListener("click", () => { videoPreview.currentTime = Number(button.dataset.filmTime); }));
+  const thumbnailUrl = endpoint("/api/thumbnail", { path: filmstripPath });
+  $$("#filmstrip .frame-sprite").forEach((frame) => {
+    frame.style.backgroundImage = `url("${thumbnailUrl}")`;
+    frame.style.backgroundSize = "cover";
+    frame.style.backgroundPosition = "center";
+  });
   try {
     const spriteUrl = await cachedFilmstripSprite(filmstripPath);
     if (state.primary?.path !== filmstripPath) return;
